@@ -659,8 +659,14 @@ def place(src, dst, log, move=False):
         except OSError:
             pass
     if how is None:
-        from .android_data import clone
-        how = clone(src, dst, allow_hardlink=True)
+        try:
+            from .android_data import clone
+        except (TypeError, OSError):  # Windows host: android_data loads libc with CDLL(None)
+            import shutil
+            shutil.copyfile(src, dst)
+            how = 'copied'
+        else:
+            how = clone(src, dst, allow_hardlink=True)
     log(f'  {os.path.basename(dst)} ({how}, {os.path.getsize(dst) / 2**20:.1f} MiB)')
 
 
