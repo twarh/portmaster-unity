@@ -1268,6 +1268,9 @@ static void constants(void)
     fj_static_string(B, "BRAND", UPC.brand);
     fj_static_string(B, "PRODUCT", UPC.product);
     fj_static_string(B, "HARDWARE", UPC.hardware);
+    /* API 31+: Unity 6000.x reads these natively at startup; null crashed Huntdown (6000.5.8f1) */
+    fj_static_string(B, "SOC_MODEL", UPC.hardware);
+    fj_static_string(B, "SOC_MANUFACTURER", UPC.manufacturer);
     fj_static_string(B, "FINGERPRINT", UPC.fingerprint);
     fj_static_string(B, "BOARD", UPC.device);
     fj_static_string(B, "TAGS", "release-keys");
