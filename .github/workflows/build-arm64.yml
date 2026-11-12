@@ -1,0 +1,31 @@
+name: build-arm64
+# Builds the arm64 runtime (ua_host) and the setup tool (pmu) with the repo's own Docker scripts
+# on a native arm64 runner. No game data is ever used here.
+on:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Runtime (ua_host arm64)
+        run: ARCH=arm64 sh runtime/build.sh 2>&1 | tee runtime-build.log
+      - name: Setup tool (pmu)
+        run: bash setup-rs/tools/build_pmu.sh out/pmu 2>&1 | tee pmu-build.log
+      - name: Collect
+        if: always()
+        run: |
+          mkdir -p dist
+          cp -a runtime/host/out/arm64 dist/host-arm64 || true
+          mkdir -p dist/media-licenses && cp -a runtime/media/out/arm64/licenses/. dist/media-licenses/ || true
+          cp -a out/pmu dist/pmu || true
+          cp *.log dist/ || true
+          find dist -maxdepth 2 | head -50
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ua-arm64
+          path: dist
