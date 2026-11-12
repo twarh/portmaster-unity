@@ -15,6 +15,7 @@ typedef SLint16 SLmillibel;
 typedef SLuint32 SLmillisecond;
 typedef SLint16 SLpermille;
 typedef SLuint8 SLchar;
+typedef int64_t SLAint64;
 
 struct SLInterfaceID_ {
     SLuint32 time_low;
@@ -30,6 +31,8 @@ typedef struct { void *pLocator; void *pFormat; } SLDataSource;
 typedef struct { void *pLocator; void *pFormat; } SLDataSink;
 typedef struct { SLuint32 locatorType; SLuint32 numBuffers; } SLDataLocator_BufferQueue;  // also Android simple BQ
 typedef struct { SLuint32 locatorType; void *outputMix; } SLDataLocator_OutputMix;
+// SL_DATALOCATOR_ANDROIDFD: an fd, a byte offset into it and a length (-1: to the end of the file).
+typedef struct { SLuint32 locatorType; SLint32 fd; SLAint64 offset; SLAint64 length; } SLDataLocator_AndroidFD;
 typedef struct {
     SLuint32 formatType, numChannels, samplesPerSec /* milliHz */, bitsPerSample, containerSize,
              channelMask, endianness;
@@ -67,6 +70,7 @@ typedef struct { SLuint32 count; SLuint32 index; } SLBufferQueueState;  // index
 #define SL_DATALOCATOR_OUTPUTMIX 4u
 #define SL_DATALOCATOR_BUFFERQUEUE 6u
 #define SL_DATALOCATOR_ANDROIDSIMPLEBUFFERQUEUE 0x800007BDu
+#define SL_DATALOCATOR_ANDROIDFD 0x800007BCu
 #define SL_DATAFORMAT_PCM 2u
 #define SL_ANDROID_DATAFORMAT_PCM_EX 4u
 #define SL_ANDROID_PCM_REPRESENTATION_SIGNED_INT 1u

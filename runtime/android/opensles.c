@@ -10,6 +10,12 @@
 // the enqueued buffers in order and calls the buffer-queue callback (without our lock held) each
 // time a buffer is used up, like Android's AudioTrack callback thread does.
 //
+// A player can also read a whole stream from an fd (SL_DATALOCATOR_ANDROIDFD: the fd, an offset and
+// a length, -1 or 0 = to the end; Broken Sword Reforged's music): the Ogg pages are demuxed here and
+// each Opus packet decoded to 48 kHz s16 in the fill with the libopus the media core links into
+// ua_host. Play/Pause/Stop, Volume, SEEK SetPosition/SetLoop work on that stream; SetPosition
+// decodes from the start and discards, so 0 (a stop, a loop) is instant.
+//
 // Output (ANDROID_SLES_OUTPUT): sdl = an SDL audio device; pipe = raw PCM piped into a sound-server
 // client (ANDROID_SLES_PIPE_CMD, else the first that works of pw-cat for PipeWire and pacat for
 // PulseAudio, found through XDG_RUNTIME_DIR, and the system's aplay) - for 32-bit programs on a 64-bit system
@@ -43,6 +49,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <sys/resource.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
@@ -145,6 +152,25 @@ typedef struct obj {
             unsigned pipe_dry;            // writes that found the pipe empty (the client waited on us)
             float *mixbuf;                // android_sles_set_mix's float buffer (output thread only)
             int mixcap;
+            // Ogg Opus stream player (SL_DATALOCATOR_ANDROIDFD): decoded in the fill, 48 kHz s16
+            int is_fd;                    // source is an Ogg Opus stream on an fd
+            int fd;                       // dup of the caller's, pread at its offset: -1 if none
+            int64_t fd_off, fd_end;       // the bytes it may read: [fd_off, fd_end)
+            int64_t rd_pos;               // reader position in that range
+            unsigned char page[255 + 65025];   // a page's lacing table, then its body
+            int seg_i, seg_n, body_pos;
+            unsigned char *pkt;           // packet being assembled (may span pages)
+            int pkt_len, pkt_cap;
+            int hdr_skip;                 // OpusHead/OpusTags packets still to skip
+            int opus_ch, opus_streams, opus_coupled, opus_preskip, opus_preskip_total;
+            unsigned char opus_map[8];
+            void *opus;                   // OpusMSDecoder (libopus, linked through the media core)
+            int16_t *pcm;                 // one packet decoded, interleaved
+            int pcm_pos, pcm_frames;
+            int stream_end, end_sent;
+            int loop;
+            SLmillisecond loop_start, loop_end;
+            int opus_warned;
         } p;
     };
 } obj;
@@ -313,9 +339,216 @@ static void apply_gain(obj *o, uint8_t *buf, int len)
     }
 }
 
+// ---- Ogg Opus stream player (SL_DATALOCATOR_ANDROIDFD) --------------------------------------
+// BS1R's music: a complete Ogg Opus stream at an fd, offset and length (an APK's asset). libopus
+// (BSD-3-Clause) is linked into ua_host by the media core (runtime/media merges libopus.a into
+// libuamedia.a, and ../host/build.sh links that after the shims); the references are weak so the
+// shims' own test binary, which links no decoder, still links - there (or with a stream the decoder
+// refuses) the player stays silent and says so once.
+struct OpusMSDecoder;
+extern struct OpusMSDecoder *opus_multistream_decoder_create(int fs, int channels, int streams,
+        int coupled_streams, const unsigned char *mapping, int *error) __attribute__((weak));
+extern int opus_multistream_decode(struct OpusMSDecoder *st, const unsigned char *data, int32_t len,
+        int16_t *pcm, int frame_size, int decode_fec) __attribute__((weak));
+extern void opus_multistream_decoder_destroy(struct OpusMSDecoder *st) __attribute__((weak));
+
+#define STREAM_MAX_FRAMES 5760          // one Opus packet: 120 ms at 48 kHz
+
+static int stream_pread(obj *o, void *buf, int n, int64_t pos)
+{
+    if (pos < o->p.fd_off) return -1;
+    if (pos + n > o->p.fd_end) n = (int)(o->p.fd_end - pos);
+    int got = 0;
+    while (got < n) {
+        ssize_t k = pread(o->p.fd, (char *)buf + got, (size_t)(n - got), (off_t)(pos + got));
+        if (k < 0 && errno == EINTR) continue;
+        if (k <= 0) break;
+        got += (int)k;
+    }
+    return got;
+}
+
+// The next Ogg page: header, lacing table, then body in o->p.page (the lacing values at its start).
+// 1: a page, 0: the range ended, -1: not an Ogg page.
+static int stream_page(obj *o)
+{
+    unsigned char h[27];
+    int n = stream_pread(o, h, (int)sizeof h, o->p.rd_pos);
+    if (n == 0) return 0;
+    if (n < (int)sizeof h || memcmp(h, "OggS", 4)) return -1;
+    o->p.rd_pos += (int)sizeof h;
+    int nsegs = h[26];               // the page's segment count is the header's last byte
+    if (stream_pread(o, o->p.page, nsegs, o->p.rd_pos) != nsegs) return -1;
+    o->p.rd_pos += nsegs;
+    int body = 0;
+    for (int i = 0; i < nsegs; i++) body += o->p.page[i];
+    if (body > (int)sizeof o->p.page - 255) return -1;
+    if (stream_pread(o, o->p.page + nsegs, body, o->p.rd_pos) != body) return -1;
+    o->p.rd_pos += body;
+    o->p.seg_i = 0;
+    o->p.seg_n = nsegs;
+    o->p.body_pos = nsegs;
+    return 1;
+}
+
+// The next packet; one may span pages (the lacing value 255 continues it).
+static int stream_packet(obj *o, int *plen)
+{
+    o->p.pkt_len = 0;
+    for (;;) {
+        if (o->p.seg_i >= o->p.seg_n) {
+            int r = stream_page(o);
+            if (r <= 0) return r;
+        }
+        int lace = o->p.page[o->p.seg_i++];
+        if (o->p.pkt_len + lace > o->p.pkt_cap) {
+            int cap = o->p.pkt_len + lace + 4096;
+            unsigned char *b = realloc(o->p.pkt, (size_t)cap);
+            if (!b) return -1;
+            o->p.pkt = b;
+            o->p.pkt_cap = cap;
+        }
+        memcpy(o->p.pkt + o->p.pkt_len, o->p.page + o->p.body_pos, (size_t)lace);
+        o->p.pkt_len += lace;
+        o->p.body_pos += lace;
+        if (lace < 255) { *plen = o->p.pkt_len; return 1; }
+    }
+}
+
+// (Re)creates the decoder from the OpusHead's mapping; 0 (with one warning) when this build has no
+// libopus or it refuses the stream. The lock is held.
+static int stream_decoder_new(obj *o)
+{
+    o->p.pcm_frames = o->p.pcm_pos = 0;
+    if (!opus_multistream_decoder_create || !opus_multistream_decode) {
+        if (!o->p.opus_warned) {
+            SHIM_WARN("OpenSL: fd player %p: no Opus decoder in this program (libuamedia.a brings libopus "
+                      "into ua_host): music stays silent", (void *)o);
+            o->p.opus_warned = 1;
+        }
+        return 0;
+    }
+    int err = 0;
+    o->p.opus = opus_multistream_decoder_create(48000, o->p.opus_ch, o->p.opus_streams,
+                                                o->p.opus_coupled, o->p.opus_map, &err);
+    if (!o->p.opus) {
+        SHIM_WARN("OpenSL: fd player %p: Opus decoder refused the stream (error %d): music stays silent",
+                  (void *)o, err);
+        o->p.opus_warned = 1;
+        return 0;
+    }
+    return 1;
+}
+
+// Back to the stream's first page (OpusHead is at create already parsed: skip it and OpusTags).
+static void stream_rewind(obj *o)
+{
+    o->p.rd_pos = o->p.fd_off;
+    o->p.seg_i = o->p.seg_n = 0;
+    o->p.pkt_len = 0;
+    o->p.hdr_skip = 2;
+    o->p.opus_preskip = o->p.opus_preskip_total;
+    o->p.pcm_frames = o->p.pcm_pos = 0;
+    o->p.stream_end = o->p.end_sent = 0;
+}
+
+// 1: one packet decoded into o->p.pcm (from pcm_pos, pcm_frames of them), 0: end of stream or no
+// decoder, -1: malformed. The lock is held.
+static int stream_decode_packet(obj *o)
+{
+    for (;;) {
+        int plen = 0;
+        int r = stream_packet(o, &plen);
+        if (r <= 0) return r;
+        if (o->p.hdr_skip > 0) { o->p.hdr_skip--; continue; }
+        if (!o->p.opus || !opus_multistream_decode || plen <= 0) return 0;
+        int n = opus_multistream_decode(o->p.opus, o->p.pkt, plen, o->p.pcm, STREAM_MAX_FRAMES, 0);
+        if (n <= 0) {
+            if (!o->p.opus_warned) {
+                SHIM_WARN("OpenSL: fd player %p: Opus decode failed (%d): music stays silent", (void *)o, n);
+                o->p.opus_warned = 1;
+            }
+            return 0;
+        }
+        o->p.pcm_pos = 0;
+        o->p.pcm_frames = n;
+        if (o->p.opus_preskip > 0) {
+            int k = o->p.opus_preskip < n ? o->p.opus_preskip : n;
+            o->p.opus_preskip -= k;
+            o->p.pcm_pos = k;
+            o->p.pcm_frames = n - k;
+            if (!o->p.pcm_frames) continue;
+        }
+        return 1;
+    }
+}
+
+// Seeks to a sample position by decoding from the stream's start and discarding: exact, and
+// instant for 0, which is what Stop and a loop ask for. The lock is held.
+static void stream_seek_locked(obj *o, int64_t frames)
+{
+    int64_t left = frames > 0 ? frames : 0;
+    if (o->p.opus && opus_multistream_decoder_destroy) opus_multistream_decoder_destroy(o->p.opus);
+    o->p.opus = NULL;
+    stream_rewind(o);
+    stream_decoder_new(o);
+    while (left > 0 && o->p.opus) {
+        if (o->p.pcm_frames <= 0 && stream_decode_packet(o) <= 0) break;
+        int k = o->p.pcm_frames < left ? o->p.pcm_frames : (int)left;
+        o->p.pcm_pos += k;
+        o->p.pcm_frames -= k;
+        if (!o->p.pcm_frames) o->p.pcm_pos = 0;
+        left -= k;
+    }
+    o->p.bytes_played = (uint64_t)(frames - left) * (uint64_t)o->p.frame_bytes;
+}
+
+// The stream player's fill: decode a packet when the last is used up, then copy; a loop restarts
+// at its start position, an end without one sends SL_PLAYEVENT_HEADATEND once.
+static void stream_fill(obj *o, Uint8 *stream, int len)
+{
+    int off = 0, ended = 0;
+    pthread_mutex_lock(&o->p.lock);
+    while (off < len && o->p.play_state == SL_PLAYSTATE_PLAYING) {
+        if (o->p.pcm_frames <= 0 && stream_decode_packet(o) <= 0) {
+            if (!o->p.loop) { ended = 1; break; }
+            stream_seek_locked(o, (int64_t)o->p.loop_start * 48);
+            if (o->p.pcm_frames <= 0 && stream_decode_packet(o) <= 0) { ended = 1; break; }
+        }
+        int fb = o->p.frame_bytes, ch = o->p.spec.channels;
+        int frames = (len - off) / fb;
+        if (frames > o->p.pcm_frames) frames = o->p.pcm_frames;
+        if (frames <= 0) break;
+        memcpy(stream + off, o->p.pcm + (size_t)o->p.pcm_pos * ch, (size_t)frames * fb);
+        o->p.pcm_pos += frames;
+        o->p.pcm_frames -= frames;
+        if (!o->p.pcm_frames) o->p.pcm_pos = 0;
+        off += frames * fb;
+        o->p.bytes_played += (uint64_t)frames * fb;
+        if (o->p.loop && o->p.loop_end != SL_TIME_UNKNOWN &&
+            o->p.bytes_played / (uint64_t)fb >= (uint64_t)o->p.loop_end * 48)
+            stream_seek_locked(o, (int64_t)o->p.loop_start * 48);
+    }
+    apply_gain(o, stream, off);
+    slPlayCallback cb = NULL;
+    void *ctx = NULL;
+    if (ended) o->p.stream_end = 1;
+    if (ended && !o->p.end_sent && (o->p.play_mask & SL_PLAYEVENT_HEADATEND)) {
+        o->p.end_sent = 1;
+        cb = o->p.play_cb;
+        ctx = o->p.play_cb_ctx;
+    }
+    pthread_mutex_unlock(&o->p.lock);
+    if (off < len) memset(stream + off, o->p.spec.silence, (size_t)(len - off));
+    mix_in(o, stream, len);
+    if (o->p.capture) fwrite(stream, 1, (size_t)len, o->p.capture);
+    if (cb) cb((SLPlayItf)&o->p.play, ctx, SL_PLAYEVENT_HEADATEND);
+}
+
 static void player_fill(obj *o, Uint8 *stream, int len)
 {
     int off = 0;
+    if (o->p.is_fd) { stream_fill(o, stream, len); return; }
     pthread_mutex_lock(&o->p.lock);
     while (off < len && o->p.play_state == SL_PLAYSTATE_PLAYING) {
         if (o->p.count == 0) {
@@ -664,7 +897,7 @@ static void capture_open(obj *o)
 
 static SLresult player_realize(obj *o)
 {
-    if (!o->p.is_bq) return SL_RESULT_CONTENT_UNSUPPORTED;
+    if (!o->p.is_bq && !o->p.is_fd) return SL_RESULT_CONTENT_UNSUPPORTED;
     capture_open(o);
     const char *mode = output_mode();
     o->p.pipe_fd = -1;
@@ -807,6 +1040,12 @@ static void Object_Destroy(SLObjectItf self)
         if (o->p.capture) fclose(o->p.capture);
         if (o->p.underruns) SHIM_TRACE("OpenSL: player %p had %u underruns", (void *)o, o->p.underruns);
         if (o->p.pipe_dry) SHIM_TRACE("OpenSL: player %p: its pipe ran dry %u times", (void *)o, o->p.pipe_dry);
+        if (o->p.is_fd) {
+            if (o->p.opus && opus_multistream_decoder_destroy) opus_multistream_decoder_destroy(o->p.opus);
+            if (o->p.fd >= 0) close(o->p.fd);
+            free(o->p.pkt);
+            free(o->p.pcm);
+        }
         pthread_mutex_destroy(&o->p.lock);
         free(o->p.queue);
         free(o->p.mixbuf);
@@ -880,7 +1119,13 @@ static SLresult Play_SetPlayState(SLPlayItf self, SLuint32 state)
     pthread_mutex_lock(&o->p.lock);
     SLuint32 old = o->p.play_state;
     o->p.play_state = state;
-    if (state == SL_PLAYSTATE_STOPPED) o->p.bytes_played = 0;   // position resets; the queue is kept
+    if (o->p.is_fd) {
+        // a stream has a position of its own: Stop starts it over, Play after its end does too
+        if (state == SL_PLAYSTATE_STOPPED || (state == SL_PLAYSTATE_PLAYING && o->p.stream_end))
+            stream_seek_locked(o, 0);
+    } else if (state == SL_PLAYSTATE_STOPPED) {
+        o->p.bytes_played = 0;                  // position resets; the queue is kept
+    }
     pthread_mutex_unlock(&o->p.lock);
     SHIM_TRACE("OpenSL: player %p play state %u -> %u (queued %u)", (void *)o, old, state, o->p.count);
     // The SDL device keeps running (silence unless PLAYING): no SDL call here, so SetPlayState never
@@ -1045,13 +1290,39 @@ static const struct SLEffectSendItf_ effectsend_vtbl = {
 };
 
 static SLresult Seek_SetPosition(SLSeekItf self, SLmillisecond pos, SLuint32 mode)
-{ (void)self; (void)pos; (void)mode; return SL_RESULT_SUCCESS; }
+{
+    obj *o = OBJ(self);
+    (void)mode;
+    if (!o->p.is_fd) return SL_RESULT_SUCCESS;   // buffer-queue players: nothing to seek (as before)
+    if (pos == SL_TIME_UNKNOWN) return SL_RESULT_PARAMETER_INVALID;
+    pthread_mutex_lock(&o->p.lock);
+    stream_seek_locked(o, (int64_t)pos * 48);    // ms at 48 kHz: Opus's rate
+    pthread_mutex_unlock(&o->p.lock);
+    return SL_RESULT_SUCCESS;
+}
 static SLresult Seek_SetLoop(SLSeekItf self, SLboolean en, SLmillisecond start, SLmillisecond end)
-{ (void)self; (void)en; (void)start; (void)end; return SL_RESULT_SUCCESS; }
+{
+    obj *o = OBJ(self);
+    if (!o->p.is_fd) return SL_RESULT_SUCCESS;   // buffer-queue players: as before
+    pthread_mutex_lock(&o->p.lock);
+    o->p.loop = en ? 1 : 0;
+    o->p.loop_start = start == SL_TIME_UNKNOWN ? 0 : start;
+    o->p.loop_end = (end == SL_TIME_UNKNOWN || end <= o->p.loop_start) ? SL_TIME_UNKNOWN : end;
+    pthread_mutex_unlock(&o->p.lock);
+    return SL_RESULT_SUCCESS;
+}
 static SLresult Seek_GetLoop(SLSeekItf self, SLboolean *pEn, SLmillisecond *pStart, SLmillisecond *pEnd)
 {
-    (void)self;
+    obj *o = OBJ(self);
     if (!pEn || !pStart || !pEnd) return SL_RESULT_PARAMETER_INVALID;
+    if (o->p.is_fd) {
+        pthread_mutex_lock(&o->p.lock);
+        *pEn = o->p.loop ? SL_BOOLEAN_TRUE : SL_BOOLEAN_FALSE;
+        *pStart = o->p.loop_start;
+        *pEnd = o->p.loop_end;
+        pthread_mutex_unlock(&o->p.lock);
+        return SL_RESULT_SUCCESS;
+    }
     *pEn = SL_BOOLEAN_FALSE;
     *pStart = *pEnd = SL_TIME_UNKNOWN;
     return SL_RESULT_SUCCESS;
@@ -1206,6 +1477,86 @@ static SLresult pcm_to_sdl(const SLDataFormat_PCM *f, SDL_AudioSpec *spec)
     return SL_RESULT_SUCCESS;
 }
 
+// SL_DATALOCATOR_ANDROIDFD's player: the caller's fd (dup'd: its file position and close are its
+// own, as Android's AudioTrack with ANDROIDFD), offset and length; the first packet is OpusHead,
+// which gives the stream's format. 0: ready; SL_RESULT_*: refused (the caller destroys the object).
+static SLresult fd_player_init(obj *o, const SLDataLocator_AndroidFD *loc)
+{
+    o->p.is_fd = 1;
+    o->p.fd = -1;
+    if (!loc || loc->fd < 0) return SL_RESULT_PARAMETER_INVALID;
+    int fd = dup(loc->fd);
+    if (fd < 0) {
+        SHIM_WARN("OpenSL: fd player: dup(%d) failed: %s", loc->fd, strerror(errno));
+        return SL_RESULT_RESOURCE_ERROR;
+    }
+    o->p.fd = fd;
+    o->p.fd_off = loc->offset > 0 ? loc->offset : 0;
+    if (loc->length > 0) {
+        o->p.fd_end = o->p.fd_off + loc->length;
+    } else {
+        struct stat st;               // length -1 (SL_DATALOCATOR_ANDROIDFD_USE_FILE_SIZE), or 0
+        if (fstat(fd, &st) != 0) {
+            SHIM_WARN("OpenSL: fd player: fstat(%d) failed: %s", loc->fd, strerror(errno));
+            return SL_RESULT_RESOURCE_ERROR;
+        }
+        o->p.fd_end = st.st_size;
+    }
+    if (o->p.fd_end <= o->p.fd_off) {
+        SHIM_WARN("OpenSL: fd player: no bytes at fd %d offset %lld", loc->fd, (long long)o->p.fd_off);
+        return SL_RESULT_PARAMETER_INVALID;
+    }
+    // OpusHead (RFC 7845): 1 byte version, channels, pre-skip, input rate, gain, family, then, for
+    // family 1 and above, the stream count, coupled count and channel mapping.
+    o->p.rd_pos = o->p.fd_off;
+    int plen = 0;
+    int r = stream_packet(o, &plen);
+    if (r != 1 || plen < 19 || memcmp(o->p.pkt, "OpusHead", 8)) {
+        SHIM_WARN("OpenSL: fd player: not an Ogg Opus stream (read %d, %d bytes)", r, plen);
+        return SL_RESULT_CONTENT_UNSUPPORTED;
+    }
+    const unsigned char *h = o->p.pkt;
+    o->p.opus_ch = h[9];
+    o->p.opus_preskip = o->p.opus_preskip_total = h[10] | h[11] << 8;
+    int gain = (int16_t)(h[16] | h[17] << 8);   // Q7.8 dB, the header's output gain
+    if (gain)
+        SHIM_WARN("OpenSL: fd player: the Opus header's output gain %d (Q7.8 dB) is not applied", gain);
+    int family = h[18];
+    if (family == 0) {
+        o->p.opus_streams = 1;
+        o->p.opus_coupled = o->p.opus_ch > 1;
+        memset(o->p.opus_map, 0, sizeof o->p.opus_map);
+        for (int i = 0; i < o->p.opus_ch && i < 8; i++) o->p.opus_map[i] = (unsigned char)i;
+    } else if (plen >= 21 + o->p.opus_ch && o->p.opus_ch <= 8) {
+        o->p.opus_streams = h[19];
+        o->p.opus_coupled = h[20];
+        memset(o->p.opus_map, 0, sizeof o->p.opus_map);
+        memcpy(o->p.opus_map, h + 21, (size_t)o->p.opus_ch);
+    } else {
+        SHIM_WARN("OpenSL: fd player: Opus channel mapping family %d not supported", family);
+        return SL_RESULT_CONTENT_UNSUPPORTED;
+    }
+    if (o->p.opus_ch < 1 || o->p.opus_ch > 8) {
+        SHIM_WARN("OpenSL: fd player: %d channels not supported", o->p.opus_ch);
+        return SL_RESULT_CONTENT_UNSUPPORTED;
+    }
+    o->p.hdr_skip = 1;                // OpusTags is the next packet
+    o->p.spec.freq = 48000;
+    o->p.spec.format = AUDIO_S16LSB;
+    o->p.spec.channels = (Uint8)o->p.opus_ch;
+    o->p.spec.samples = 512;
+    o->p.frame_bytes = 2 * o->p.opus_ch;
+    o->p.pcm = malloc((size_t)STREAM_MAX_FRAMES * o->p.opus_ch * sizeof(int16_t));
+    if (!o->p.pcm) return SL_RESULT_MEMORY_FAILURE;
+    o->p.loop_start = 0;
+    o->p.loop_end = SL_TIME_UNKNOWN;
+    stream_decoder_new(o);            // says so once, and stays silent, when the build has no decoder
+    SHIM_WARN("OpenSL: fd player %p: Ogg Opus %d ch at 48 kHz, pre-skip %d, fd %d bytes %lld..%lld",
+              (void *)o, o->p.opus_ch, o->p.opus_preskip_total, loc->fd,
+              (long long)o->p.fd_off, (long long)o->p.fd_end);
+    return SL_RESULT_SUCCESS;
+}
+
 static SLresult Engine_CreateAudioPlayer(SLEngineItf self, SLObjectItf *pPlayer, SLDataSource *src, SLDataSink *snk,
                                          SLuint32 n, const SLInterfaceID *ids, const SLboolean *req)
 {
@@ -1213,6 +1564,29 @@ static SLresult Engine_CreateAudioPlayer(SLEngineItf self, SLObjectItf *pPlayer,
     if (!pPlayer || !src || !src->pLocator || !snk || !snk->pLocator) return SL_RESULT_PARAMETER_INVALID;
     *pPlayer = NULL;
     SLuint32 loc = *(const SLuint32 *)src->pLocator;
+    if (loc == SL_DATALOCATOR_ANDROIDFD) {
+        const SLDataLocator_AndroidFD *fl = src->pLocator;
+        if (*(const SLuint32 *)snk->pLocator != SL_DATALOCATOR_OUTPUTMIX || !fl || fl->fd < 0)
+            return SL_RESULT_PARAMETER_INVALID;
+        if (!check_required(K_PLAYER, 0, n, ids, req)) return SL_RESULT_FEATURE_UNSUPPORTED;
+        obj *o = obj_new(K_PLAYER);
+        if (!o) return SL_RESULT_MEMORY_FAILURE;
+        o->p.play = (itf){ &play_vtbl, o };
+        o->p.bq = (itf){ &bq_vtbl, o };
+        o->p.volume = (itf){ &volume_vtbl, o };
+        o->p.config = (itf){ &config_vtbl, o };
+        o->p.effectsend = (itf){ &effectsend_vtbl, o };
+        o->p.seek = (itf){ &seek_vtbl, o };
+        pthread_mutex_init(&o->p.lock, NULL);
+        o->p.play_state = SL_PLAYSTATE_STOPPED;
+        o->p.gain = 1.0f;
+        o->p.pipe_fd = -1;
+        o->p.stream_type = SL_ANDROID_STREAM_MEDIA;
+        SLresult r = fd_player_init(o, fl);
+        if (r != SL_RESULT_SUCCESS) { Object_Destroy((SLObjectItf)&o->object); return r; }
+        *pPlayer = (SLObjectItf)&o->object;
+        return SL_RESULT_SUCCESS;
+    }
     if (loc != SL_DATALOCATOR_ANDROIDSIMPLEBUFFERQUEUE && loc != SL_DATALOCATOR_BUFFERQUEUE) {
         SHIM_WARN("OpenSL: CreateAudioPlayer: source locator 0x%x not supported (PCM buffer queues only)", loc);
         return SL_RESULT_CONTENT_UNSUPPORTED;
