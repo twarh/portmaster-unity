@@ -1468,6 +1468,18 @@ void up_android_register(void)
     MU(C, "getApplicationContext", "()Landroid/content/Context;", h_obj, &g_activity);
     /* AndroidJavaObject.Call<AndroidJavaObject>("getApplicationContext") of newer Unity (Rewired, IAP) asks for Object */
     MU(C, "getApplicationContext", "()Ljava/lang/Object;", h_obj, &g_activity);
+    /* Unity AndroidJavaObject.Call<AndroidJavaObject>(...) asks with an Object return descriptor: alias the common getters */
+    M(C, "getFilesDir", "()Ljava/lang/Object;", ctx_getFilesDir);
+    M(C, "getCacheDir", "()Ljava/lang/Object;", ctx_getCacheDir);
+    M(C, "getExternalFilesDir", "(Ljava/lang/String;)Ljava/lang/Object;", ctx_getExtFilesDir);
+    M(C, "getExternalCacheDir", "()Ljava/lang/Object;", ctx_getExtCacheDir);
+    M(C, "getObbDir", "()Ljava/lang/Object;", ctx_getObbDir);
+    MU(C, "getAssets", "()Ljava/lang/Object;", h_obj, &g_assets);
+    MU(C, "getContentResolver", "()Ljava/lang/Object;", h_obj, &g_content_resolver);
+    MU(C, "getPackageManager", "()Ljava/lang/Object;", h_obj, &g_pm);
+    MU(C, "getApplicationInfo", "()Ljava/lang/Object;", h_obj, &g_appinfo);
+    MU(C, "getResources", "()Ljava/lang/Object;", h_obj, &g_resources);
+    MU(C, "getClassLoader", "()Ljava/lang/Object;", h_obj, &g_class_loader);
     MU(C, "getResources", "()Landroid/content/res/Resources;", h_obj, &g_resources);
     MU(C, "getClassLoader", "()Ljava/lang/ClassLoader;", h_obj, &g_class_loader);
     M(C, "getSharedPreferences", "(Ljava/lang/String;I)Landroid/content/SharedPreferences;", ctx_getSharedPrefs);
