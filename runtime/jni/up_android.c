@@ -1801,6 +1801,8 @@ void up_android_register(void)
     M(UP_CLS, "removeViewFromPlayer", "(Landroid/view/View;)V", h_void);
     SM(UP_CLS, "UnitySendMessage", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V", up_sendMessage);
     fj_field_define(UP_CLS, "currentActivity", "Landroid/app/Activity;", 1, fj_l(NULL));
+    /* Terraria (XNAUnityRunner) reads it as Object via AndroidJavaClass.GetStatic<AndroidJavaObject> */
+    fj_field_define(UP_CLS, "currentActivity", "Ljava/lang/Object;", 1, fj_l(NULL));
     /* added after 2017.4 (UnityPlayerJavaWrapper of 2018.4-2022.3) */
     M(UP_CLS, "getClipboardText", "()Ljava/lang/String;", up_getClipboard);
     M(UP_CLS, "setClipboardText", "(Ljava/lang/String;)V", up_setClipboard);
@@ -1938,6 +1940,7 @@ void up_android_create_objects(void)
     NEWG(g_activity, "com/unity3d/player/UnityPlayerActivity");
     NEWG(g_player, UP_CLS);
     fj_static_object(UP_CLS, "currentActivity", "Landroid/app/Activity;", g_activity);
+    fj_static_object(UP_CLS, "currentActivity", "Ljava/lang/Object;", g_activity);
     NEWG(g_surfaceview, "android/view/SurfaceView");
     NEWG(g_holder, "android/view/SurfaceHolder");
     g_surface = fj_global(fj_new_by_name("android/view/Surface", UPC.native_window, NULL));
