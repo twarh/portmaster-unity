@@ -89,6 +89,17 @@ static float g_ptr_rx, g_ptr_ry;                /* right stick, -1..1 */
 static unsigned g_ptr_clicks;                   /* click controls held (PTR_A/PTR_R1/PTR_RT) */
 static double g_ptr_last, g_ptr_sent, g_ptr_full;
 
+/* NA_AXES=1: the pad's sticks/triggers/d-pad go to the engine as joystick motion events, which
+ * its own gamepad cursor reads (Broken Sword Reforged: left stick AXIS_X/AXIS_Y moves a free
+ * cursor, right stick AXIS_Z/AXIS_RZ, triggers AXIS_LTRIGGER/AXIS_RTRIGGER change its speed, d-pad
+ * AXIS_HAT_X/AXIS_HAT_Y plus the KEYCODE_DPAD_* keys navigate menus). Off by default; it replaces
+ * the NA_POINTER path when on. Values are indexed by Android's AXIS_* ids (android_shims.h). */
+static int g_axes_on;
+static float g_axes[ANDROID_AXIS_COUNT];
+static unsigned g_axes_dpad;                    /* 1 up, 2 down, 4 left, 8 right */
+static int g_axes_dirty;                        /* changed since the last event sent */
+static double g_axes_sent;                      /* CLOCK_MONOTONIC of the last event sent */
+
 /* egl_glue.c's swap hook (eglSwapBuffers of the engine's thread): proof that frames are presented,
  * and where the cursor is drawn (the engine's GL context is current here, just before the swap) */
 static void na_swap_hook(void *ctx)
@@ -265,6 +276,77 @@ static int na_pointer_button(Uint8 b)
     return b == SDL_CONTROLLER_BUTTON_A ? PTR_A : b == SDL_CONTROLLER_BUTTON_RIGHTSHOULDER ? PTR_R1 : 0;
 }
 
+/* ---- NA_AXES: sticks/triggers/d-pad as joystick motion events -------------------------------- */
+#define AXES_MIN_INTERVAL 0.008     /* <= ~125 events/s */
+#define AXES_STICK_DEADZONE 0.08f   /* per axis, on the sticks */
+
+static double na_axes_now(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec / 1e9;
+}
+
+/* sends the whole axis state once it changed, at most every AXES_MIN_INTERVAL (the loop calls it,
+ * so a change inside the interval is sent a few ms later, not lost) */
+static void na_axes_flush(void)
+{
+    if (!g_axes_on || !g_axes_dirty) return;
+    double now = na_axes_now();
+    if (g_axes_sent > 0 && now - g_axes_sent < AXES_MIN_INTERVAL) return;
+    g_axes_sent = now;
+    g_axes_dirty = 0;
+    if (g_queue)
+        android_input_queue_push(g_queue, android_input_event_new_joystick(0, 2, g_axes));
+}
+
+static void na_axes_axis(Uint8 axis, Sint16 value)
+{
+    int id;
+    switch (axis) {
+    case SDL_CONTROLLER_AXIS_LEFTX: id = 0; break;                 /* AXIS_X */
+    case SDL_CONTROLLER_AXIS_LEFTY: id = 1; break;                 /* AXIS_Y */
+    case SDL_CONTROLLER_AXIS_RIGHTX: id = 11; break;               /* AXIS_Z */
+    case SDL_CONTROLLER_AXIS_RIGHTY: id = 14; break;               /* AXIS_RZ */
+    case SDL_CONTROLLER_AXIS_TRIGGERLEFT: id = 17; break;          /* AXIS_LTRIGGER */
+    case SDL_CONTROLLER_AXIS_TRIGGERRIGHT: id = 18; break;         /* AXIS_RTRIGGER */
+    default: return;
+    }
+    float v;
+    if (id >= 17) {
+        v = value <= 0 ? 0.0f : value / 32767.0f;                  /* triggers: 0..1 */
+    } else {
+        v = value / 32768.0f;
+        if (fabsf(v) < AXES_STICK_DEADZONE) v = 0.0f;
+        else if (v > 1.0f) v = 1.0f; else if (v < -1.0f) v = -1.0f;
+    }
+    if (v == g_axes[id]) return;
+    g_axes[id] = v;
+    g_axes_dirty = 1;
+}
+
+/* the d-pad stays a KEYCODE_DPAD_* key too (menus); its held buttons make AXIS_HAT_X/AXIS_HAT_Y */
+static void na_axes_dpad(Uint8 b, int down)
+{
+    unsigned bit;
+    switch (b) {
+    case SDL_CONTROLLER_BUTTON_DPAD_UP: bit = 1; break;
+    case SDL_CONTROLLER_BUTTON_DPAD_DOWN: bit = 2; break;
+    case SDL_CONTROLLER_BUTTON_DPAD_LEFT: bit = 4; break;
+    case SDL_CONTROLLER_BUTTON_DPAD_RIGHT: bit = 8; break;
+    default: return;
+    }
+    unsigned old = g_axes_dpad;
+    if (down) g_axes_dpad |= bit; else g_axes_dpad &= ~bit;
+    if (g_axes_dpad == old) return;
+    float hx = (g_axes_dpad & 8 ? 1.0f : 0.0f) - (g_axes_dpad & 4 ? 1.0f : 0.0f);
+    float hy = (g_axes_dpad & 2 ? 1.0f : 0.0f) - (g_axes_dpad & 1 ? 1.0f : 0.0f);
+    if (hx == g_axes[15] && hy == g_axes[16]) return;
+    g_axes[15] = hx;                                               /* AXIS_HAT_X */
+    g_axes[16] = hy;                                               /* AXIS_HAT_Y */
+    g_axes_dirty = 1;
+}
+
 static void on_sdl_event(const SDL_Event *e)
 {
     switch (e->type) {
@@ -278,6 +360,7 @@ static void on_sdl_event(const SDL_Event *e)
         push_key(1, key_of(e->key.keysym.sym));
         break;
     case SDL_CONTROLLERBUTTONDOWN:
+        if (g_axes_on) na_axes_dpad(e->cbutton.button, 1);
         if (g_ptr_on && na_pointer_button(e->cbutton.button)) {
             na_pointer_click(na_pointer_button(e->cbutton.button), 1);
             break;
@@ -285,6 +368,7 @@ static void on_sdl_event(const SDL_Event *e)
         push_key(0, padkey_of(e->cbutton.button));
         break;
     case SDL_CONTROLLERBUTTONUP:
+        if (g_axes_on) na_axes_dpad(e->cbutton.button, 0);
         if (g_ptr_on && na_pointer_button(e->cbutton.button)) {
             na_pointer_click(na_pointer_button(e->cbutton.button), 0);
             break;
@@ -292,6 +376,10 @@ static void on_sdl_event(const SDL_Event *e)
         push_key(1, padkey_of(e->cbutton.button));
         break;
     case SDL_CONTROLLERAXISMOTION:
+        if (g_axes_on) {
+            na_axes_axis(e->caxis.axis, e->caxis.value);
+            break;
+        }
         if (!g_ptr_on) break;
         if (e->caxis.axis == SDL_CONTROLLER_AXIS_RIGHTX) g_ptr_rx = e->caxis.value / 32768.0f;
         else if (e->caxis.axis == SDL_CONTROLLER_AXIS_RIGHTY) g_ptr_ry = e->caxis.value / 32768.0f;
@@ -387,16 +475,22 @@ int nativeact_run(const char *root, const char *apk_name)
     android_shims_set_api_level(sdk_int);
 
     // NA_POINTER=1: the right stick moves a cursor; A/R1/RT click it with touch events. NA_CURSOR=0
-    // keeps the cursor undrawn (a game that shows its own). Both off/unread: the input is as before.
+    // keeps the cursor undrawn (a game that shows its own). NA_AXES=1 sends the pad's axes as
+    // joystick motion events instead (the engine's own gamepad cursor); the two never both act.
+    const char *na = getenv("NA_AXES");
+    g_axes_on = na && *na && strcmp(na, "0") != 0;
     const char *np = getenv("NA_POINTER");
-    g_ptr_on = np && *np && strcmp(np, "0") != 0;
+    g_ptr_on = !g_axes_on && np && *np && strcmp(np, "0") != 0;
     const char *nc = getenv("NA_CURSOR");
     g_ptr_cursor_on = !(nc && !strcmp(nc, "0"));
     g_ptr_px = (g_window_w - 1) * 0.5f;
     g_ptr_py = (g_window_h - 1) * 0.5f;
     g_ptr_x = (int)lroundf(g_ptr_px);
     g_ptr_y = (int)lroundf(g_ptr_py);
-    if (g_ptr_on)
+    if (g_axes_on)
+        fprintf(stderr, "[nativeact] NA_AXES: pad sticks/triggers/d-pad as joystick motion events"
+                        " (NA_POINTER off)\n");
+    else if (g_ptr_on)
         fprintf(stderr, "[nativeact] NA_POINTER: right stick moves a cursor, A/R1/RT click at it\n");
 
     // SDL gamepads (the window itself is display_sdl.c's)
@@ -468,6 +562,7 @@ int nativeact_run(const char *root, const char *apk_name)
     while (!g_finish && !display_quit_requested()) {
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) on_sdl_event(&ev);
+        na_axes_flush();
         na_pointer_tick();
         na_fire_obb_complete(act.env, act.clazz);   /* also if OBBFetch came later (once only) */
         usleep(4000);

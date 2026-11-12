@@ -199,12 +199,16 @@ int ALooper_pollAll(int timeoutMillis, int *outFd, int *outEvents, void **outDat
 #define AINPUT_SOURCE_KEYBOARD 0x101
 #define AINPUT_SOURCE_GAMEPAD 0x401
 #define AINPUT_SOURCE_TOUCHSCREEN 0x1002
+#define AINPUT_SOURCE_JOYSTICK 0x01000010
+#define AINPUT_EVENT_AXIS_COUNT ANDROID_AXIS_COUNT   /* ids up to AXIS_BRAKE (23), from android_shims.h */
+#define AINPUT_EVENT_TOOL_JOYSTICK 5                 /* AMOTION_EVENT_TOOL_TYPE_JOYSTICK */
 
 struct AInputEvent {
     int32_t type, deviceId, source;
     int32_t action, keyCode, metaState, flags, repeatCount, scanCode;
     int32_t buttons, toolType;
     float x, y;
+    float axes[AINPUT_EVENT_AXIS_COUNT];    /* joystick events, indexed by Android AXIS_* id */
     int64_t downTime, eventTime;
 };
 
@@ -242,6 +246,23 @@ AInputEvent *android_input_event_new_motion(int32_t deviceId, int32_t action, in
     return e;
 }
 
+AInputEvent *android_input_event_new_joystick(int32_t deviceId, int32_t action,
+                                              const float axes[ANDROID_AXIS_COUNT])
+{
+    AInputEvent *e = calloc(1, sizeof *e);
+    if (!e) return NULL;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    e->type = AINPUT_EVENT_TYPE_MOTION;
+    e->deviceId = deviceId;
+    e->source = AINPUT_SOURCE_JOYSTICK;
+    e->action = action;
+    e->toolType = AINPUT_EVENT_TOOL_JOYSTICK;
+    if (axes) memcpy(e->axes, axes, sizeof e->axes);
+    e->eventTime = e->downTime = ts.tv_sec * 1000000000LL + ts.tv_nsec;
+    return e;
+}
+
 void android_input_event_free(AInputEvent *e) { free(e); }
 
 int32_t AInputEvent_getType(const AInputEvent *e) { return e ? e->type : 0; }
@@ -258,12 +279,30 @@ int64_t AKeyEvent_getEventTime(const AInputEvent *e) { return e ? e->eventTime :
 int32_t AMotionEvent_getAction(const AInputEvent *e) { return e ? e->action : 0; }
 size_t AMotionEvent_getPointerCount(const AInputEvent *e) { return e && e->type == AINPUT_EVENT_TYPE_MOTION; }
 int32_t AMotionEvent_getPointerId(const AInputEvent *e, size_t i) { (void)e; (void)i; return 0; }
-SOFTFP float AMotionEvent_getX(const AInputEvent *e, size_t i) { (void)i; return e ? e->x : 0; }
-SOFTFP float AMotionEvent_getY(const AInputEvent *e, size_t i) { (void)i; return e ? e->y : 0; }
+static int ainput_event_is_joystick(const AInputEvent *e)
+{
+    return e && (e->source & AINPUT_SOURCE_JOYSTICK) != 0;
+}
+
+SOFTFP float AMotionEvent_getX(const AInputEvent *e, size_t i)
+{
+    (void)i;
+    if (!e) return 0;
+    return ainput_event_is_joystick(e) ? e->axes[0] : e->x;     /* AXIS_X */
+}
+SOFTFP float AMotionEvent_getY(const AInputEvent *e, size_t i)
+{
+    (void)i;
+    if (!e) return 0;
+    return ainput_event_is_joystick(e) ? e->axes[1] : e->y;     /* AXIS_Y */
+}
 SOFTFP float AMotionEvent_getAxisValue(const AInputEvent *e, int32_t axis, size_t i)
 {
     (void)i;
-    return !e ? 0 : axis == 0 ? e->x : axis == 1 ? e->y : 0;
+    if (!e) return 0;
+    if (ainput_event_is_joystick(e))
+        return axis >= 0 && axis < AINPUT_EVENT_AXIS_COUNT ? e->axes[axis] : 0;
+    return axis == 0 ? e->x : axis == 1 ? e->y : 0;
 }
 int32_t AMotionEvent_getButtonState(const AInputEvent *e) { return e ? e->buttons : 0; }
 int32_t AMotionEvent_getToolType(const AInputEvent *e, size_t i)

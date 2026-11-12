@@ -194,6 +194,13 @@ AInputEvent *android_input_event_new_key(int32_t deviceId, int32_t action, int32
 // A one-pointer motion event (action: 0 down, 1 up, 2 move; x/y in pixels). Integers so that
 // armhf hosts need no softfp handling.
 AInputEvent *android_input_event_new_motion(int32_t deviceId, int32_t action, int32_t x, int32_t y);
+// A one-pointer joystick motion event (action: AMOTION_EVENT_ACTION_MOVE = 2; source
+// AINPUT_SOURCE_JOYSTICK = 0x01000010, tool type 5). `axes` is indexed by Android's AXIS_* ids
+// (0 X, 1 Y, 11 Z, 14 RZ, 15 HAT_X, 16 HAT_Y, 17 LTRIGGER, 18 RTRIGGER, 22 GAS, 23 BRAKE) and has
+// ANDROID_AXIS_COUNT entries; AMotionEvent_getAxisValue returns them, getX/getY the X/Y ones.
+enum { ANDROID_AXIS_COUNT = 24 };
+AInputEvent *android_input_event_new_joystick(int32_t deviceId, int32_t action,
+                                              const float axes[ANDROID_AXIS_COUNT]);
 void android_input_event_free(AInputEvent *e);
 int32_t AInputEvent_getType(const AInputEvent *e);
 int32_t AInputEvent_getDeviceId(const AInputEvent *e);
