@@ -1273,6 +1273,25 @@ static int parse_dynamic(so_module *m)
         }
         m->nsyms = maxi + 1;
     }
+    {   /* imports sit above the exported symbols: widen nsyms to cover them */
+        size_t mx = m->nsyms;
+        for (size_t i = 0; m->rel && i < m->nrel; i++) {
+            size_t k = ELFW(R_SYM)(m->rel[i].r_info) + 1; if (k > mx) mx = k; }
+        for (size_t i = 0; m->rela && i < m->nrela; i++) {
+            size_t k = ELFW(R_SYM)(m->rela[i].r_info) + 1; if (k > mx) mx = k; }
+        if (m->jmprel) {
+            size_t n = m->jmprelsz / (m->jmprel_rela ? sizeof(ElfW(Rela)) : sizeof(ElfW(Rel)));
+            for (size_t i = 0; i < n; i++) {
+                size_t k = ELFW(R_SYM)(m->jmprel_rela ? ((const ElfW(Rela)*)m->jmprel)[i].r_info
+                                                      : ((const ElfW(Rel)*)m->jmprel)[i].r_info) + 1;
+                if (k > mx) mx = k; }
+        }
+        if ((const char *)m->strtab > (const char *)m->symtab) {
+            size_t ext = ((const char *)m->strtab - (const char *)m->symtab) / sizeof(ElfW(Sym));
+            if (ext > mx && ext < 0x400000) mx = ext;
+        }
+        m->nsyms = mx;
+    }
     /* soname and needed */
     for (ElfW(Dyn) *d = m->dyn; d->d_tag != DT_NULL; d++) {
         if (d->d_tag == DT_SONAME) m->soname = m->strtab + d->d_un.d_val;
