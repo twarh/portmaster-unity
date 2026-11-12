@@ -98,6 +98,24 @@ H(f_space)
     return fj_j((jlong)(ud ? v.f_blocks : v.f_bavail) * v.f_frsize);
 }
 
+/* android.os.StatFs: path kept as data; ud 0=free blocks 1=total blocks 2=block size */
+H(sf_init) { fj_set_data(self, strdup(jstr(a[0])), free); return fj_v(); }
+H(sf_get)
+{
+    struct statvfs v;
+    const char *p = fj_data(self);
+    if (!p || statvfs(p, &v) != 0) { if (statvfs("/mnt/SDCARD", &v) != 0) return fj_j(0); }
+    long u = (long)(intptr_t)ud;
+    if (u == 2) return fj_j((jlong)v.f_frsize);
+    return fj_j((jlong)(u ? v.f_blocks : v.f_bavail));
+}
+H(sf_getI)
+{
+    jvalue r = sf_get(env, self, a, ud);
+    return fj_i((jint)r.j);
+}
+H(act_false) { return fj_z(0); }
+
 /* ---- Bundle (string-valued key/value store) --------------------------------------------- */
 typedef struct kv { struct kv *next; char *k, *v; } kv;
 typedef struct { kv *head; pthread_mutex_t mu; } bundle;
@@ -1715,6 +1733,17 @@ void up_android_register(void)
     M(F, "getUsableSpace", "()J", f_space);
     M(F, "getFreeSpace", "()J", f_space);
     MU(F, "getTotalSpace", "()J", f_space, 1);
+
+    CLS("android/os/StatFs", NULL);
+    M("android/os/StatFs", "<init>", "(Ljava/lang/String;)V", sf_init);
+    MU("android/os/StatFs", "getAvailableBlocksLong", "()J", sf_get, 0);
+    MU("android/os/StatFs", "getBlockCountLong", "()J", sf_get, 1);
+    MU("android/os/StatFs", "getBlockSizeLong", "()J", sf_get, 2);
+    MU("android/os/StatFs", "getFreeBlocksLong", "()J", sf_get, 0);
+    MU("android/os/StatFs", "getAvailableBlocks", "()I", sf_getI, 0);
+    MU("android/os/StatFs", "getBlockCount", "()I", sf_getI, 1);
+    MU("android/os/StatFs", "getBlockSize", "()I", sf_getI, 2);
+    M("com/unity3d/player/UnityPlayerActivity", "HasTouchScreen", "()Z", act_false);
 
     /* java.lang */
     M("java/lang/ClassLoader", "findLibrary", "(Ljava/lang/String;)Ljava/lang/String;", cl_findLibrary);
