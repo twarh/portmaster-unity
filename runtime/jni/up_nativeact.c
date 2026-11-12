@@ -16,19 +16,71 @@
  *   fetch)                                 no-ops; the completions stay pending, which is what a
  *                                          phone without the Play services does
  *   textRenderBitmap                       NULL (the engine's FreeType path draws text)
+ *   getScreenSize / getAvailableMemory     what libBS1R's JNI_OnLoad registered them as natives
+ *                                          on NA_NATIVE; if they are not registered (or answer 0)
+ *                                          the host window's height and the machine's free memory.
+ *                                          The fake framework has no DisplayMetrics/MemoryInfo for
+ *                                          a native to read, so 0 would size the display/FBOs 0.
+ *   OBBFetch                               no-op: the assets come from the APK, no OBB is fetched
  */
 #define _GNU_SOURCE
 #include "up_internal.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-/* the class the engine's activity object has (found in libBS1R.so); the JNI natives it exports
- * live in uk/co/cyborg/napp/MainActivity, which is this class' package on the device */
+/* The APK's activity classes: uk/co/cyborg/napp/MainActivity is the NativeActivity that declares
+ * (and libBS1R.so registers in JNI_OnLoad) the platform natives; the engine's activity object is
+ * its subclass uk/co/revolution/bs1r/google/MainActivity, the manifest's activity, so the natives
+ * are inherited and found on it. */
 #define NA_MAIN   "uk/co/revolution/bs1r/google/MainActivity"
 #define NA_NATIVE "uk/co/cyborg/napp/MainActivity"
 
+/* The ANativeWindow shims (runtime/android) are in the host binary, not in libfakejni.a (the JNI
+ * unit tests link the library without them): use the window only where the host has it. */
+typedef struct ANativeWindow ANativeWindow;
+extern ANativeWindow *android_window_get(void) __attribute__((weak));
+extern int32_t ANativeWindow_getHeight(ANativeWindow *w) __attribute__((weak));
+
 static jvalue na_str(const char *s) { return fj_l(fj_string(s ? s : "")); }
+
+/* The host window's height in pixels (480 on the test device). */
+static int na_screen_h(void)
+{
+    if (android_window_get && ANativeWindow_getHeight) {
+        ANativeWindow *w = android_window_get();
+        if (w) {
+            int h = ANativeWindow_getHeight(w);
+            if (h > 0) return h;
+        }
+    }
+    return 480;
+}
+
+/* MemAvailable of /proc/meminfo in bytes; the engine only needs a plausible number. */
+static jint na_memory_available(void)
+{
+    long kb = 0;
+    char line[128];
+    FILE *f = fopen("/proc/meminfo", "r");
+    if (f) {
+        while (fgets(line, sizeof line, f))
+            if (sscanf(line, "MemAvailable: %ld kB", &kb) == 1) break;
+        fclose(f);
+    }
+    if (kb < 64 * 1024) kb = 512 * 1024;      /* unreadable: half a gigabyte */
+    long long b = (long long)kb * 1024;
+    return (jint)(b > 0x7fffffff ? 0x7fffffff : b);
+}
+
+/* The class of the activity chain that libBS1R registered `name` on, or NULL. */
+static const char *na_native_class(const char *name, const char *sig)
+{
+    if (fj_native(NA_NATIVE, name, sig)) return NA_NATIVE;
+    if (fj_native(NA_MAIN, name, sig)) return NA_MAIN;
+    return NULL;
+}
 
 H(na_language)
 {
@@ -49,6 +101,28 @@ H(na_false) { (void)self; (void)a; return fj_z(JNI_FALSE); }
 H(na_null) { (void)self; (void)a; return fj_l(NULL); }
 H(na_void) { (void)self; (void)a; return fj_v(); }
 
+H(na_screen_size)
+{
+    (void)a;
+    const char *cls = na_native_class("getScreenSize", "()F");
+    if (cls) {
+        jvalue r = fj_call_native(cls, "getScreenSize", "()F", self);
+        if (r.f > 0.0f) return r;
+    }
+    return fj_f((jfloat)na_screen_h());
+}
+
+H(na_memory)
+{
+    (void)a;
+    const char *cls = na_native_class("getAvailableMemory", "()I");
+    if (cls) {
+        jvalue r = fj_call_native(cls, "getAvailableMemory", "()I", self);
+        if (r.i > 0) return r;
+    }
+    return fj_i(na_memory_available());
+}
+
 /* Every method the engine's Java side could call, as an instance method and as a static one
  * (which of the two Call*Method the engine uses is not visible in its imports). */
 static void reg(const char *name, const char *sig, fj_fn fn)
@@ -64,8 +138,9 @@ void up_nativeact_register(void)
     done = 1;
     fj_init();
     fj_class_define("android/app/Activity", NULL);
-    fj_class_define(NA_MAIN, "android/app/Activity");
-    fj_class_define(NA_NATIVE, NA_MAIN);
+    fj_class_define("android/app/NativeActivity", "android/app/Activity");
+    fj_class_define(NA_NATIVE, "android/app/NativeActivity");
+    fj_class_define(NA_MAIN, NA_NATIVE);
 
     reg("getLocaleLanguage", "()Ljava/lang/String;", na_language);
     reg("getLocaleCountry", "()Ljava/lang/String;", na_country);
@@ -86,6 +161,16 @@ void up_nativeact_register(void)
     reg("platformSaveGameRead", "(Ljava/lang/String;)V", na_void);
     reg("platformSaveGameWrite", "(Ljava/lang/String;[B)V", na_void);
     reg("assetPackFetch", "(Ljava/lang/String;)V", na_void);
+
+    /* The natives libBS1R registers on NA_NATIVE in JNI_OnLoad (which runs before this, so the
+     * registration is recorded on the same class object): the handler delegates to the registered
+     * native, and answers with the host values if it is absent or answers 0 (see the header). */
+    fj_method_define(NA_NATIVE, "getScreenSize", "()F", 0, na_screen_size, NULL);
+    fj_method_define(NA_NATIVE, "getScreenSize", "()F", 1, na_screen_size, NULL);
+    fj_method_define(NA_NATIVE, "getAvailableMemory", "()I", 0, na_memory, NULL);
+    fj_method_define(NA_NATIVE, "getAvailableMemory", "()I", 1, na_memory, NULL);
+    fj_method_define(NA_NATIVE, "OBBFetch", "()V", 0, na_void, NULL);
+    fj_method_define(NA_NATIVE, "OBBFetch", "()V", 1, na_void, NULL);
 }
 
 /* The ANativeActivity's clazz: an instance of the engine's activity class, kept for the process. */
