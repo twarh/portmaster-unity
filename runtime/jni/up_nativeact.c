@@ -21,7 +21,10 @@
  *                                          the host window's height and the machine's free memory.
  *                                          The fake framework has no DisplayMetrics/MemoryInfo for
  *                                          a native to read, so 0 would size the display/FBOs 0.
- *   OBBFetch                               no-op: the assets come from the APK, no OBB is fetched
+ *   OBBFetch                               marks the OBB fetch pending; the host fires the
+ *                                          engine's Java_..._MainActivity_OBBFetchComplete after
+ *                                          the activity exists (the assets come from the APK, no
+ *                                          OBB is fetched)
  */
 #define _GNU_SOURCE
 #include "up_internal.h"
@@ -101,6 +104,23 @@ H(na_false) { (void)self; (void)a; return fj_z(JNI_FALSE); }
 H(na_null) { (void)self; (void)a; return fj_l(NULL); }
 H(na_void) { (void)self; (void)a; return fj_v(); }
 
+/* OBBFetch is Java-side dex code in the APK: the engine calls it and then waits for the exported
+ * Java_uk_co_cyborg_napp_MainActivity_OBBFetchComplete to be called. The assets are in the APK and
+ * no OBB exists, so the completion is reported at once — but not from here: this runs inside the
+ * engine's own Java call, and re-entering the game would nest its JNI use. Only mark it pending;
+ * the host (runtime/host/nativeact.c) fires the callback on the activity thread. */
+static volatile int g_obb_pending;
+
+int up_nativeact_obb_pending(void) { return g_obb_pending; }
+
+H(na_obb_fetch)
+{
+    (void)self; (void)a;
+    fprintf(stderr, "[na] OBBFetch\n");
+    g_obb_pending = 1;
+    return fj_v();
+}
+
 H(na_screen_size)
 {
     (void)a;
@@ -169,8 +189,8 @@ void up_nativeact_register(void)
     fj_method_define(NA_NATIVE, "getScreenSize", "()F", 1, na_screen_size, NULL);
     fj_method_define(NA_NATIVE, "getAvailableMemory", "()I", 0, na_memory, NULL);
     fj_method_define(NA_NATIVE, "getAvailableMemory", "()I", 1, na_memory, NULL);
-    fj_method_define(NA_NATIVE, "OBBFetch", "()V", 0, na_void, NULL);
-    fj_method_define(NA_NATIVE, "OBBFetch", "()V", 1, na_void, NULL);
+    fj_method_define(NA_NATIVE, "OBBFetch", "()V", 0, na_obb_fetch, NULL);
+    fj_method_define(NA_NATIVE, "OBBFetch", "()V", 1, na_obb_fetch, NULL);
 }
 
 /* The ANativeActivity's clazz: an instance of the engine's activity class, kept for the process. */

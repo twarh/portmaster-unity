@@ -68,6 +68,7 @@ struct ANativeActivity {
 typedef void (*nativeactivity_oncreate_fn)(ANativeActivity *activity, void *savedState, size_t savedStateSize);
 
 extern jobject up_nativeact_activity(void);     /* runtime/jni/up_nativeact.c */
+extern int     up_nativeact_obb_pending(void);  /* runtime/jni/up_nativeact.c */
 
 /* ---- state ----------------------------------------------------------------------------------- */
 static volatile sig_atomic_t g_finish;
@@ -76,6 +77,21 @@ static int g_window_w = 640, g_window_h = 480;
 
 static void on_activity_finish(void *activity) { (void)activity; g_finish = 1; }
 static void on_signal(int s) { (void)s; g_finish = 1; }
+
+/* The engine's OBBFetch is dex code that returns immediately and then waits for this exported
+ * callback of libBS1R; a phone without an OBB would never see it. The assets are in the APK, so
+ * report completion once, on this thread (the activity thread), from the lifecycle or the looper:
+ * never from inside the engine's own Java call. */
+static void (*g_obb_complete)(void *env, void *activity);
+static int g_obb_fired;
+
+static void na_fire_obb_complete(void *env, void *activity)
+{
+    if (g_obb_fired || !g_obb_complete || !up_nativeact_obb_pending()) return;
+    g_obb_fired = 1;
+    fprintf(stderr, "[na] OBBFetchComplete\n");
+    g_obb_complete(env, activity);
+}
 
 static void mkdir_p(const char *path)
 {
@@ -285,6 +301,8 @@ int nativeact_run(const char *root, const char *apk_name)
         jint v = onload(fj_vm(), NULL);
         fprintf(stderr, "[nativeact] JNI_OnLoad -> %d\n", (int)v);
     }
+    g_obb_complete = (void (*)(void *, void *))so_sym(m, "Java_uk_co_cyborg_napp_MainActivity_OBBFetchComplete");
+    if (!g_obb_complete) fprintf(stderr, "[nativeact] no OBBFetchComplete export in %s\n", lib);
 
     static ANativeActivityCallbacks cbs;
     static ANativeActivity act;
@@ -323,9 +341,13 @@ int nativeact_run(const char *root, const char *apk_name)
     if (cbs.onWindowFocusChanged) cbs.onWindowFocusChanged(&act, 1);
     fprintf(stderr, "[nativeact] running\n");
 
+    /* the engine may have asked for the OBB fetch during create/resume */
+    na_fire_obb_complete(act.env, act.clazz);
+
     while (!g_finish && !display_quit_requested()) {
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) on_sdl_event(&ev);
+        na_fire_obb_complete(act.env, act.clazz);   /* also if OBBFetch came later (once only) */
         usleep(4000);
     }
 
