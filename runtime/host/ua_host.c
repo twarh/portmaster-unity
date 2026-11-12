@@ -643,6 +643,13 @@ int main(int argc, char **argv)
     // a game's own NativeActivity engine instead of a Unity player (UA_NATIVEACTIVITY=1,
     // nativeact.h): the display, the shims and the loader above are what it runs on
     if (getenv("UA_NATIVEACTIVITY") && strcmp(getenv("UA_NATIVEACTIVITY"), "0")) {
+        // no up_start() on this path: the fake framework's DisplayMetrics and View sizes
+        // (../jni/up_android.c) answer UPC's size, so give it the window the engine draws into
+        // (nativeact.c's ANativeWindow, 640x480 when there is none)
+        ANativeWindow *na_win = android_window_get();
+        int na_w = na_win ? ANativeWindow_getWidth(na_win) : 0;
+        int na_h = na_win ? ANativeWindow_getHeight(na_win) : 0;
+        up_resize(na_w > 0 ? na_w : 640, na_h > 0 ? na_h : 480);
         int r = nativeact_run(root, pj_apk);
         fflush(NULL);
         _exit(r);

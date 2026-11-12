@@ -15,6 +15,7 @@
 
 #include "../loader/so_loader.h"
 #include "../android/android_shims.h"
+#include "../android/egl_glue.h"
 #include "../jni/fakejni.h"
 #include "display.h"
 
@@ -74,6 +75,16 @@ extern int     up_nativeact_obb_pending(void);  /* runtime/jni/up_nativeact.c */
 static volatile sig_atomic_t g_finish;
 static AInputQueue *g_queue;
 static int g_window_w = 640, g_window_h = 480;
+
+/* egl_glue.c's swap hook (eglSwapBuffers of the engine's thread): proof that frames are presented */
+static void na_swap_hook(void *ctx)
+{
+    static unsigned n;
+    (void)ctx;
+    n++;
+    if (n == 1) fprintf(stderr, "[na] first swap\n");
+    if (n % 60 == 0) fprintf(stderr, "[na] swap %u\n", n);
+}
 
 static void on_activity_finish(void *activity) { (void)activity; g_finish = 1; }
 static void on_signal(int s) { (void)s; g_finish = 1; }
@@ -336,9 +347,16 @@ int nativeact_run(const char *root, const char *apk_name)
     if (cbs.onStart) cbs.onStart(&act);
     if (cbs.onResume) cbs.onResume(&act);
     if (cbs.onNativeWindowCreated) cbs.onNativeWindowCreated(&act, win);
+    if (cbs.onNativeWindowResized) cbs.onNativeWindowResized(&act, win);
+    if (cbs.onNativeWindowRedrawNeeded) cbs.onNativeWindowRedrawNeeded(&act, win);
+    if (cbs.onContentRectChanged) {
+        ARect rect = { 0, 0, g_window_w, g_window_h };
+        cbs.onContentRectChanged(&act, &rect);
+    }
     g_queue = android_input_queue_create();
     if (g_queue && cbs.onInputQueueCreated) cbs.onInputQueueCreated(&act, g_queue);
     if (cbs.onWindowFocusChanged) cbs.onWindowFocusChanged(&act, 1);
+    egl_glue_set_swap_hook(na_swap_hook, NULL);
     fprintf(stderr, "[nativeact] running\n");
 
     /* the engine may have asked for the OBB fetch during create/resume */
