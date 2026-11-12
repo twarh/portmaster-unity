@@ -1466,6 +1466,8 @@ void up_android_register(void)
     MU(C, "getPackageManager", "()Landroid/content/pm/PackageManager;", h_obj, &g_pm);
     MU(C, "getApplicationInfo", "()Landroid/content/pm/ApplicationInfo;", h_obj, &g_appinfo);
     MU(C, "getApplicationContext", "()Landroid/content/Context;", h_obj, &g_activity);
+    /* AndroidJavaObject.Call<AndroidJavaObject>("getApplicationContext") of newer Unity (Rewired, IAP) asks for Object */
+    MU(C, "getApplicationContext", "()Ljava/lang/Object;", h_obj, &g_activity);
     MU(C, "getResources", "()Landroid/content/res/Resources;", h_obj, &g_resources);
     MU(C, "getClassLoader", "()Ljava/lang/ClassLoader;", h_obj, &g_class_loader);
     M(C, "getSharedPreferences", "(Ljava/lang/String;I)Landroid/content/SharedPreferences;", ctx_getSharedPrefs);
