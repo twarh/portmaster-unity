@@ -114,7 +114,7 @@ typedef struct obj {
         struct { itf engine; int sdl; } e;   // sdl: holds SDL's audio subsystem
         struct { itf mix; } m;
         struct {
-            itf play, bq, volume, config;
+            itf play, bq, volume, config, effectsend, seek;
             pthread_mutex_t lock;
             SDL_AudioDeviceID dev;
             SDL_AudioSpec spec;           // requested == obtained (SDL converts)
@@ -758,6 +758,8 @@ static itf *find_itf(obj *o, SLInterfaceID id)
         if (iid_eq(id, SL_IID_PLAY)) return &o->p.play;
         if (iid_eq(id, SL_IID_VOLUME)) return &o->p.volume;
         if (iid_eq(id, SL_IID_ANDROIDCONFIGURATION)) return &o->p.config;
+        if (iid_eq(id, SL_IID_EFFECTSEND)) return &o->p.effectsend;
+        if (iid_eq(id, SL_IID_SEEK)) return &o->p.seek;
         if (o->p.is_bq && (iid_eq(id, SL_IID_ANDROIDSIMPLEBUFFERQUEUE) || iid_eq(id, SL_IID_BUFFERQUEUE)))
             return &o->p.bq;
         break;
@@ -1005,6 +1007,58 @@ static SLresult BQ_RegisterCallback(SLBufferQueueItf self, slBufferQueueCallback
 
 static const struct SLBufferQueueItf_ bq_vtbl = { BQ_Enqueue, BQ_Clear, BQ_GetState, BQ_RegisterCallback };
 
+// ---- Effect send and seek interfaces (no-op: games list them, some never call them) ---------
+// Layouts as in the OpenSL ES headers (SLEffectSendItf_, SLSeekItf_).
+typedef const struct SLEffectSendItf_ *const *SLEffectSendItf;
+struct SLEffectSendItf_ {
+    SLresult (*EnableEffectSend)(SLEffectSendItf self, const void *pAuxEffect, SLboolean enable,
+                                 SLmillibel initialLevel);
+    SLresult (*IsEnabled)(SLEffectSendItf self, const void *pAuxEffect, SLboolean *pEnable);
+    SLresult (*SetDirectLevel)(SLEffectSendItf self, SLmillibel directLevel);
+    SLresult (*GetDirectLevel)(SLEffectSendItf self, SLmillibel *pDirectLevel);
+    SLresult (*SetSendLevel)(SLEffectSendItf self, const void *pAuxEffect, SLmillibel level);
+    SLresult (*GetSendLevel)(SLEffectSendItf self, const void *pAuxEffect, SLmillibel *pLevel);
+};
+
+typedef const struct SLSeekItf_ *const *SLSeekItf;
+struct SLSeekItf_ {
+    SLresult (*SetPosition)(SLSeekItf self, SLmillisecond pos, SLuint32 seekMode);
+    SLresult (*SetLoop)(SLSeekItf self, SLboolean loopEnable, SLmillisecond startPos, SLmillisecond endPos);
+    SLresult (*GetLoop)(SLSeekItf self, SLboolean *pLoopEnabled, SLmillisecond *pStartPos, SLmillisecond *pEndPos);
+};
+
+static SLresult ES_EnableEffectSend(SLEffectSendItf self, const void *aux, SLboolean enable, SLmillibel level)
+{ (void)self; (void)aux; (void)enable; (void)level; return SL_RESULT_SUCCESS; }
+static SLresult ES_IsEnabled(SLEffectSendItf self, const void *aux, SLboolean *pEnable)
+{ (void)self; (void)aux; if (!pEnable) return SL_RESULT_PARAMETER_INVALID; *pEnable = SL_BOOLEAN_FALSE;
+  return SL_RESULT_SUCCESS; }
+static SLresult ES_SetDirectLevel(SLEffectSendItf self, SLmillibel level) { (void)self; (void)level; return SL_RESULT_SUCCESS; }
+static SLresult ES_GetDirectLevel(SLEffectSendItf self, SLmillibel *pLevel)
+{ (void)self; if (!pLevel) return SL_RESULT_PARAMETER_INVALID; *pLevel = 0; return SL_RESULT_SUCCESS; }
+static SLresult ES_SetSendLevel(SLEffectSendItf self, const void *aux, SLmillibel level)
+{ (void)self; (void)aux; (void)level; return SL_RESULT_SUCCESS; }
+static SLresult ES_GetSendLevel(SLEffectSendItf self, const void *aux, SLmillibel *pLevel)
+{ (void)self; (void)aux; if (!pLevel) return SL_RESULT_PARAMETER_INVALID; *pLevel = 0; return SL_RESULT_SUCCESS; }
+
+static const struct SLEffectSendItf_ effectsend_vtbl = {
+    ES_EnableEffectSend, ES_IsEnabled, ES_SetDirectLevel, ES_GetDirectLevel, ES_SetSendLevel, ES_GetSendLevel,
+};
+
+static SLresult Seek_SetPosition(SLSeekItf self, SLmillisecond pos, SLuint32 mode)
+{ (void)self; (void)pos; (void)mode; return SL_RESULT_SUCCESS; }
+static SLresult Seek_SetLoop(SLSeekItf self, SLboolean en, SLmillisecond start, SLmillisecond end)
+{ (void)self; (void)en; (void)start; (void)end; return SL_RESULT_SUCCESS; }
+static SLresult Seek_GetLoop(SLSeekItf self, SLboolean *pEn, SLmillisecond *pStart, SLmillisecond *pEnd)
+{
+    (void)self;
+    if (!pEn || !pStart || !pEnd) return SL_RESULT_PARAMETER_INVALID;
+    *pEn = SL_BOOLEAN_FALSE;
+    *pStart = *pEnd = SL_TIME_UNKNOWN;
+    return SL_RESULT_SUCCESS;
+}
+
+static const struct SLSeekItf_ seek_vtbl = { Seek_SetPosition, Seek_SetLoop, Seek_GetLoop };
+
 // ---- Volume interface -----------------------------------------------------------------------
 static void update_gain(obj *o)
 {
@@ -1182,6 +1236,8 @@ static SLresult Engine_CreateAudioPlayer(SLEngineItf self, SLObjectItf *pPlayer,
     o->p.bq = (itf){ &bq_vtbl, o };
     o->p.volume = (itf){ &volume_vtbl, o };
     o->p.config = (itf){ &config_vtbl, o };
+    o->p.effectsend = (itf){ &effectsend_vtbl, o };
+    o->p.seek = (itf){ &seek_vtbl, o };
     pthread_mutex_init(&o->p.lock, NULL);
     o->p.is_bq = 1;
     o->p.spec = spec;
