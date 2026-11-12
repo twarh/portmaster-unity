@@ -10,6 +10,7 @@
 #include <fcntl.h>
 #include <link.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -17,6 +18,8 @@
 #include <sys/auxv.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
+#include <ucontext.h>
 #include <unistd.h>
 
 #include "so_loader.h"
@@ -95,6 +98,131 @@
 #define PAGE_SZ 4096u
 #define PAGE_DOWN(x) ((uintptr_t)(x) & ~(uintptr_t)(PAGE_SZ - 1))
 #define PAGE_UP(x) PAGE_DOWN((uintptr_t)(x) + PAGE_SZ - 1)
+
+/* ------------------------------------------------------------------------ */
+/* Fatal signals. The host keeps its UI thread in a poll loop while Android code runs on Unity's
+ * threads, so a fault on one of those threads must end the process: a thread that died inside
+ * the loader leaves the host waiting on it forever (the abandoned-APK black screen). The handler
+ * only uses write(2) and _exit(2) - fprintf can deadlock on stdio's lock - and names the library
+ * the loader was mapping. load_locked() installs it on every load: Android code replaces the fatal
+ * signal handlers once it runs, and a fault in a runtime System.loadLibrary() must not hang. */
+
+static const char *volatile g_loading;   /* library load_locked() is mapping */
+
+#if defined(__aarch64__)
+#define UC_PC(uc)    ((uintptr_t)(uc)->uc_mcontext.pc)
+#define UC_LR(uc)    ((uintptr_t)(uc)->uc_mcontext.regs[30])
+#define UC_SP(uc)    ((uintptr_t)(uc)->uc_mcontext.sp)
+#define UC_R(uc, n)  ((uintptr_t)(uc)->uc_mcontext.regs[n])
+#else
+#define UC_PC(uc)    ((uintptr_t)(uc)->uc_mcontext.arm_pc)
+#define UC_LR(uc)    ((uintptr_t)(uc)->uc_mcontext.arm_lr)
+#define UC_SP(uc)    ((uintptr_t)(uc)->uc_mcontext.arm_sp)
+#define UC_R(uc, n)  ((uintptr_t)(uc)->uc_mcontext.arm_r##n)
+#endif
+
+static char *crash_str(char *p, const char *s)
+{
+    while (*s) *p++ = *s++;
+    return p;
+}
+
+static char *crash_hex(char *p, uintptr_t v)
+{
+    static const char dig[] = "0123456789abcdef";
+    char t[2 * sizeof v]; int n = 0;
+    *p++ = '0'; *p++ = 'x';
+    do { t[n++] = dig[v & 15]; v >>= 4; } while (v);
+    while (n) *p++ = t[--n];
+    return p;
+}
+
+static char *crash_dec(char *p, long v)
+{
+    char t[24]; int n = 0;
+    if (v < 0) { *p++ = '-'; v = -v; }
+    do { t[n++] = (char)('0' + v % 10); v /= 10; } while (v);
+    while (n) *p++ = t[--n];
+    return p;
+}
+
+static struct sigaction g_prev_sa[32];   /* handlers that were in place before ours (Mono/Unity) */
+
+static void so_crash_handler(int sig, siginfo_t *si, void *ctx)
+{
+    if (!g_loading && sig > 0 && sig < 32) {   /* not a fault in the loader: hand it to whoever owned it */
+        struct sigaction *pv = &g_prev_sa[sig];
+        if ((pv->sa_flags & SA_SIGINFO) && pv->sa_sigaction) { pv->sa_sigaction(sig, si, ctx); return; }
+        if (!(pv->sa_flags & SA_SIGINFO) && pv->sa_handler != SIG_DFL && pv->sa_handler != SIG_IGN && pv->sa_handler) { pv->sa_handler(sig); return; }
+        signal(sig, SIG_DFL);   /* default action: the fault re-raises on return */
+        return;
+    }
+    char buf[1536], *p = buf;   /* loaded path is capped below so the text always fits */
+    const char *nm = sig == SIGSEGV ? "SEGV" : sig == SIGBUS ? "BUS" :
+                     sig == SIGILL ? "ILL" : sig == SIGFPE ? "FPE" : "?";
+    p = crash_str(p, "E/CRASH: signal ");
+    p = crash_str(p, nm);
+    p = crash_str(p, " (");
+    p = crash_dec(p, si ? si->si_code : 0);
+    p = crash_str(p, ") at ");
+    p = crash_hex(p, (uintptr_t)(si ? si->si_addr : NULL));
+    p = crash_str(p, ", tid ");
+    p = crash_dec(p, (long)syscall(SYS_gettid));
+    *p++ = '\n';
+    if (ctx) {
+        ucontext_t *uc = ctx;
+        p = crash_str(p, "E/CRASH:   pc=");
+        p = crash_hex(p, UC_PC(uc));
+        p = crash_str(p, " lr=");
+        p = crash_hex(p, UC_LR(uc));
+        p = crash_str(p, " sp=");
+        p = crash_hex(p, UC_SP(uc));
+        p = crash_str(p, " x0=");
+        p = crash_hex(p, UC_R(uc, 0));
+        p = crash_str(p, " x2=");
+        p = crash_hex(p, UC_R(uc, 2));
+        p = crash_str(p, " x4=");
+        p = crash_hex(p, UC_R(uc, 4));
+        *p++ = '\n';
+    }
+    if (g_loading) {
+        p = crash_str(p, "E/CRASH:   loading ");
+        const char *gl = g_loading;
+        for (int i = 0; gl[i] && i < 1000; i++) *p++ = gl[i];
+        *p++ = '\n';
+    }
+    (void)!write(2, buf, (size_t)(p - buf));
+    _exit(139);   /* the faulting thread cannot return; do not leave the host spinning on it */
+}
+
+/* Called at every load: Android code installs crash handlers of its own once it runs (Unity's
+ * reports and then keeps the process alive), and the loader must own the fatal signals every time
+ * it writes into a library's pages, or a fault there leaves the host spinning on a dead thread. */
+static void crash_handler_install(void)
+{
+    static char alt[64 * 1024];
+    static int stack_set;
+    if (!stack_set) {
+        stack_set = 1;
+        stack_t ss;
+        memset(&ss, 0, sizeof ss);
+        ss.ss_sp = alt;
+        ss.ss_size = sizeof alt;
+        sigaltstack(&ss, NULL);                /* a stack overflow reaches the handler too */
+    }
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = so_crash_handler;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigfillset(&sa.sa_mask);
+    static const int sigs[4] = { SIGSEGV, SIGBUS, SIGILL, SIGFPE };
+    for (int i = 0; i < 4; i++) {
+        struct sigaction cur;
+        if (sigaction(sigs[i], NULL, &cur) == 0 && !((cur.sa_flags & SA_SIGINFO) && cur.sa_sigaction == so_crash_handler))
+            g_prev_sa[sigs[i]] = cur;
+        sigaction(sigs[i], &sa, NULL);
+    }
+}
 
 /* ------------------------------------------------------------------------ */
 
@@ -1171,14 +1299,23 @@ static int map_segments(so_module *m, int fd, const ElfW(Ehdr) *eh, const ElfW(P
             }
         }
         if (p->p_memsz > p->p_filesz) {
-            if (file_end & (PAGE_SZ - 1)) memset((void *)file_end, 0, file_page_end - file_end);
-            if (seg_end > file_page_end) {
-                void *r = mmap((void *)file_page_end, seg_end - file_page_end, PROT_READ | PROT_WRITE,
+            /* The .bss part is anonymous, zeroed by the kernel, and starts at the end of the file
+             * data's last page - except for a PT_LOAD with p_filesz == 0 (.bss only, no file
+             * mapping at all, and p_vaddr need not be page aligned): there seg_page itself was
+             * never mapped, it is still the PROT_NONE reservation, so the memset of the tail of
+             * "the file's last page" wrote into it (SEGV_ACCERR at load_locked's memset, len
+             * 4096 - (seg & 4095)) and the segment's first page stayed unmapped. Map from
+             * seg_page and let the kernel zero it; the memset only runs when the file mapping
+             * covers that page. */
+            if (p->p_filesz) {
+                if (file_end & (PAGE_SZ - 1)) memset((void *)file_end, 0, file_page_end - file_end);
+            }
+            uintptr_t bss_start = p->p_filesz ? file_page_end : seg_page;
+            if (seg_end > bss_start) {
+                void *r = mmap((void *)bss_start, seg_end - bss_start, PROT_READ | PROT_WRITE,
                                MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS, -1, 0);
                 if (r == MAP_FAILED) { set_err("%s: map bss: %s", m->path, strerror(errno)); return -1; }
             }
-        } else if (!p->p_filesz) {
-            /* nothing */
         }
         if (m->nsegs < 16) {
             m->segs[m->nsegs].start = seg_page;
@@ -1351,8 +1488,12 @@ static int load_needed(so_module *m, int depth)
 
 static so_module *load_locked(const char *path, const so_shim *shims, int depth)
 {
+    /* before anything can fault on this library: it is what a crash inside here would be about */
+    if (trace()) fprintf(stderr, "[so] load_locked %s\n", path ? path : "(null)");
+    g_loading = path;
+    crash_handler_install();
     so_module *m = find_loaded(path);
-    if (m) return m;
+    if (m) { g_loading = NULL; return m; }
     libmap_defaults();
 
 #if defined(__aarch64__)
@@ -1384,6 +1525,7 @@ static so_module *load_locked(const char *path, const so_shim *shims, int depth)
 
     m = calloc(1, sizeof *m);
     m->path = strdup(path);
+    g_loading = m->path;   /* outlives the caller's copy: modules are never unloaded */
     m->name = base_name(m->path);
     m->shims = shims;
     m->handle.magic = HANDLE_MAGIC;
@@ -1468,6 +1610,7 @@ static so_module *load_locked(const char *path, const so_shim *shims, int depth)
         fprintf(stderr, "[so] %s: %d unresolved imports (SO_TRACE=1 lists them)\n", m->name, m->nunres);
     else if (trace())
         fprintf(stderr, "[so] loaded %s: %d unresolved\n", m->name, m->nunres);
+    g_loading = NULL;
     return m;
 
 fail:
@@ -1475,6 +1618,7 @@ fail:
     free(ph);
     if (m->map_start) munmap((void *)m->map_start, m->map_size);
     free(m->needed); free(m->deps); free(m->unres);
+    g_loading = NULL;
     free(m->path); free(m);
     return NULL;
 }
