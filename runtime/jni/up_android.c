@@ -1319,6 +1319,8 @@ void up_android_register(void)
     CLS("android/app/NativeActivity", "android/app/Activity");
     CLS("com/unity3d/player/UnityPlayerActivity", "android/app/Activity");
     CLS("com/unity3d/player/UnityPlayerNativeActivity", "com/unity3d/player/UnityPlayerActivity");
+    M("com/unity3d/player/UnityPlayerActivity", "SetSurfaceFrameRate", "(F)V", h_void);
+    M("com/unity3d/player/UnityPlayerActivity", "SetMouseCursorMode", "(I)V", h_void);
     CLS("android/view/View", NULL);
     CLS("android/view/ViewGroup", "android/view/View");
     CLS("android/widget/FrameLayout", "android/view/ViewGroup");
@@ -1941,6 +1943,13 @@ void up_android_create_objects(void)
     NEWG(g_player, UP_CLS);
     fj_static_object(UP_CLS, "currentActivity", "Landroid/app/Activity;", g_activity);
     fj_static_object(UP_CLS, "currentActivity", "Ljava/lang/Object;", g_activity);
+    /* Terraria's patched UnityPlayerActivity (classes.dex): boolean[330] PressedStates, MouseInside, MouseMode.
+       XNAUnityRunner reads PressedStates through AndroidJavaObject.Get (signature Object). */
+    { jobject ps = fj_global(fj_array_new("Z", 330));
+      fj_set_field(g_activity, "PressedStates", "[Z", fj_l(ps));
+      fj_set_field(g_activity, "PressedStates", "Ljava/lang/Object;", fj_l(ps));
+      fj_set_field(g_activity, "MouseInside", "Z", fj_z(1));
+      fj_set_field(g_activity, "MouseMode", "I", fj_i(-1)); }
     NEWG(g_surfaceview, "android/view/SurfaceView");
     NEWG(g_holder, "android/view/SurfaceHolder");
     g_surface = fj_global(fj_new_by_name("android/view/Surface", UPC.native_window, NULL));
