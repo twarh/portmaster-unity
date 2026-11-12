@@ -84,6 +84,11 @@ void android_log_set_min_priority(int prio);
 // Assets: directory that AAssetManager_* reads ("assets/" of the APK, unpacked).
 // Default from env ANDROID_ASSET_DIR, else "./assets".
 void android_set_asset_dir(const char *dir);
+// Assets from the APK itself (from AndroidAssetManager_open on): its `assets/` members, read
+// through the central directory (stored members with pread/mmap; deflated ones inflated with
+// zlib when the program links it, else absent). Wins over android_set_asset_dir() once set.
+// 0 on success; -1 if the file is not a readable ZIP (the directory stays in use).
+int android_set_asset_apk(const char *apk_path);
 
 // The one native window. Its size defaults to the /dev/fb0 visible size (FBIOGET_VSCREENINFO);
 // env ANDROID_WINDOW_SIZE=WxH overrides; if both fail, 720x480.
@@ -186,6 +191,9 @@ int ALooper_removeFd(ALooper *l, int fd);
 
 // Input events (the player imports these but never calls them; a host may still build events)
 AInputEvent *android_input_event_new_key(int32_t deviceId, int32_t action, int32_t keyCode, int32_t metaState);
+// A one-pointer motion event (action: 0 down, 1 up, 2 move; x/y in pixels). Integers so that
+// armhf hosts need no softfp handling.
+AInputEvent *android_input_event_new_motion(int32_t deviceId, int32_t action, int32_t x, int32_t y);
 void android_input_event_free(AInputEvent *e);
 int32_t AInputEvent_getType(const AInputEvent *e);
 int32_t AInputEvent_getDeviceId(const AInputEvent *e);
@@ -193,6 +201,20 @@ int32_t AInputEvent_getSource(const AInputEvent *e);
 int32_t AKeyEvent_getAction(const AInputEvent *e);
 int32_t AKeyEvent_getKeyCode(const AInputEvent *e);
 int32_t AKeyEvent_getMetaState(const AInputEvent *e);
+
+// AInputQueue (a host's queue for a NativeActivity: events pushed here wake the looper the app
+// attaches with AInputQueue_attachLooper; AInputQueue_getEvent pops one, -1 when none is pending)
+int32_t AInputQueue_getEvent(AInputQueue *q, AInputEvent **out);
+int32_t AInputQueue_hasEvents(AInputQueue *q);
+int32_t AInputQueue_preDispatchEvent(AInputQueue *q, AInputEvent *e);
+void AInputQueue_finishEvent(AInputQueue *q, AInputEvent *e, int handled);
+void AInputQueue_attachLooper(AInputQueue *q, ALooper *l, int ident, ALooper_callbackFunc cb, void *data);
+void AInputQueue_detachLooper(AInputQueue *q);
+AInputQueue *android_input_queue_create(void);
+void android_input_queue_push(AInputQueue *q, AInputEvent *e);   // takes ownership
+// ANativeActivity_finish(): the NativeActivity's call; the host installs what it does.
+void android_set_activity_finish(void (*fn)(void *activity));
+void ANativeActivity_finish(void *activity);
 
 // Sensors (none)
 ASensorManager *ASensorManager_getInstance(void);

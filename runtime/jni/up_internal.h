@@ -84,6 +84,9 @@ typedef struct {
 /* framework (up_android.c) */
 void     up_android_register(void);            /* classes, methods, constants      */
 void     up_android_create_objects(void);      /* activity, display, ...  (after register) */
+/* a game's own NativeActivity Java side (up_nativeact.c; runtime/host/nativeact.c) */
+void     up_nativeact_register(void);
+jobject  up_nativeact_activity(void);
 jobject  up_make_file(const char *path);       /* java.io.File, local ref          */
 jobject  up_make_input_device(int id);         /* android.view.InputDevice or NULL */
 void     up_choreographer_tick(void);          /* UnityMain: run due FrameCallbacks */

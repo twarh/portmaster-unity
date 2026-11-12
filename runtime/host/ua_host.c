@@ -47,6 +47,7 @@ void up_media_init(void);                  /* ../jni/up_media.c */
 #include "arch.h"
 #include "display.h"
 #include "fbdev.h"
+#include "nativeact.h"
 #ifndef UA_NO_STEAMSTUB
 #include "steamstub.h"
 #endif
@@ -542,8 +543,12 @@ int main(int argc, char **argv)
     if (getenv("UA_APK_NAME")) snprintf(apk, sizeof apk, "%s/%s.apk", root, getenv("UA_APK_NAME"));
     else if (pj_apk[0]) snprintf(apk, sizeof apk, "%s/%s", root, pj_apk);
     else if (!only_apk(root, apk, sizeof apk)) {
-        fprintf(stderr, "[host] no APK: set UA_APK_NAME, or keep android_package.json or a single .apk in %s\n", root);
-        return 1;
+        // a NativeActivity host can take its assets from a directory (NA_ASSET_DIR)
+        if (getenv("UA_NATIVEACTIVITY")) apk[0] = 0;
+        else {
+            fprintf(stderr, "[host] no APK: set UA_APK_NAME, or keep android_package.json or a single .apk in %s\n", root);
+            return 1;
+        }
     }
     // OBBs beside the APK by default (the data tool's zip/ layout): with an OBB mounted,
     // Application.dataPath is the OBB, and games look for files at dataPath + "/.." (e.g. a GOG
@@ -635,6 +640,13 @@ int main(int argc, char **argv)
     so_map_library("libmediandk.so", NULL);
     up_media_init();                            // the media core's decoders (../media)
     so_map_library("libvulkan.so", NULL);       // GLES only
+    // a game's own NativeActivity engine instead of a Unity player (UA_NATIVEACTIVITY=1,
+    // nativeact.h): the display, the shims and the loader above are what it runs on
+    if (getenv("UA_NATIVEACTIVITY") && strcmp(getenv("UA_NATIVEACTIVITY"), "0")) {
+        int r = nativeact_run(root, pj_apk);
+        fflush(NULL);
+        _exit(r);
+    }
     if (getenv("UA_MONO_MAIN")) {               // the player's Mono as the mono program (monoaot.c)
         void *h = so_dlopen("libmono.so", 0);
         if (!h) fprintf(stderr, "[host] UA_MONO_MAIN: no %s/libmono.so (a Mono player's)\n", libdir);

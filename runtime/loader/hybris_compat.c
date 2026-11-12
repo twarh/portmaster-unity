@@ -1208,6 +1208,10 @@ static int bionic_attr_setstacksize(pthread_attr_t *attr, size_t size)
     return _hybris_hook_pthread_attr_setstacksize(attr, size);
 }
 
+// bionic's freopen64 is freopen on LP64; the FILE* came from whatever fopen resolved to (the
+// host's, or libhybris's translation of the bionic FILE objects)
+static FILE *bionic_freopen64(const char *path, const char *mode, FILE *fp) { return freopen(path, mode, fp); }
+
 static const so_shim ours[] = {
     { "dlopen", (void *)so_dlopen }, { "dlsym", (void *)so_dlsym }, { "dlclose", (void *)so_dlclose },
     { "dlerror", (void *)so_dlerror },
@@ -1259,6 +1263,7 @@ static const so_shim ours[] = {
     { "sem_timedwait", (void *)bionic_sem_timedwait }, { "sem_getvalue", (void *)bionic_sem_getvalue },
     { "mbrtowc", (void *)bionic_mbrtowc }, { "wcrtomb", (void *)bionic_wcrtomb }, { "ungetwc", (void *)bionic_ungetwc },
     { "getnameinfo", (void *)bionic_getnameinfo }, { "__system_property_get", (void *)bionic_system_property_get },
+    { "freopen64", (void *)bionic_freopen64 },          /* bionic 64-bit stdio alias of freopen */
     /* newer players */
     { "android_set_abort_message", (void *)bionic_android_set_abort_message },
     { "__FD_SET_chk", (void *)bionic_FD_SET_chk }, { "__FD_CLR_chk", (void *)bionic_FD_CLR_chk },

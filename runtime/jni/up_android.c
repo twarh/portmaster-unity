@@ -1935,6 +1935,7 @@ void up_android_register(void)
     if (up_media_register) up_media_register();
     up_unity6_register();         /* Unity 2023.1+ (up_unity6.c) */
     up_legacy_register();         /* Unity 5.6 - 2017.2 (up_legacy.c) */
+    up_nativeact_register();      /* a game's own NativeActivity (up_nativeact.c; harmless here) */
 }
 
 void up_android_create_objects(void)

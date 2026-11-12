@@ -5,6 +5,7 @@
 #include "shim_internal.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <poll.h>
 #include <pthread.h>
 #include <string.h>
@@ -197,10 +198,12 @@ int ALooper_pollAll(int timeoutMillis, int *outFd, int *outEvents, void **outDat
 // ---- input events --------------------------------------------------------------------------
 #define AINPUT_SOURCE_KEYBOARD 0x101
 #define AINPUT_SOURCE_GAMEPAD 0x401
+#define AINPUT_SOURCE_TOUCHSCREEN 0x1002
 
 struct AInputEvent {
     int32_t type, deviceId, source;
     int32_t action, keyCode, metaState, flags, repeatCount, scanCode;
+    int32_t buttons, toolType;
     float x, y;
     int64_t downTime, eventTime;
 };
@@ -217,6 +220,24 @@ AInputEvent *android_input_event_new_key(int32_t deviceId, int32_t action, int32
     e->action = action;
     e->keyCode = keyCode;
     e->metaState = metaState;
+    e->toolType = 0;
+    e->eventTime = e->downTime = ts.tv_sec * 1000000000LL + ts.tv_nsec;
+    return e;
+}
+
+AInputEvent *android_input_event_new_motion(int32_t deviceId, int32_t action, int32_t x, int32_t y)
+{
+    AInputEvent *e = calloc(1, sizeof *e);
+    if (!e) return NULL;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    e->type = AINPUT_EVENT_TYPE_MOTION;
+    e->deviceId = deviceId;
+    e->source = AINPUT_SOURCE_TOUCHSCREEN;
+    e->action = action;
+    e->toolType = 1;                                    /* FINGER */
+    e->x = (float)x;
+    e->y = (float)y;
     e->eventTime = e->downTime = ts.tv_sec * 1000000000LL + ts.tv_nsec;
     return e;
 }
@@ -244,15 +265,117 @@ SOFTFP float AMotionEvent_getAxisValue(const AInputEvent *e, int32_t axis, size_
     (void)i;
     return !e ? 0 : axis == 0 ? e->x : axis == 1 ? e->y : 0;
 }
+int32_t AMotionEvent_getButtonState(const AInputEvent *e) { return e ? e->buttons : 0; }
+int32_t AMotionEvent_getToolType(const AInputEvent *e, size_t i)
+{
+    (void)i;
+    return e && e->type == AINPUT_EVENT_TYPE_MOTION ? e->toolType : 0;
+}
 
-// AInputQueue: no queue is ever handed out (Unity uses the Java input path).
-int32_t AInputQueue_getEvent(AInputQueue *q, AInputEvent **out) { (void)q; if (out) *out = NULL; return -1; }
-int32_t AInputQueue_hasEvents(AInputQueue *q) { (void)q; return 0; }
+// ---- AInputQueue: a host's queue (NativeActivity), woken through a pipe -----------------------
+#define INPUTQUEUE_MAX 64
+
+struct AInputQueue {
+    pthread_mutex_t lock;
+    int fd[2];                       // one byte while events are pending
+    int n;
+    AInputEvent *ev[INPUTQUEUE_MAX];
+    ALooper *looper;
+};
+
+AInputQueue *android_input_queue_create(void)
+{
+    AInputQueue *q = calloc(1, sizeof *q);
+    if (!q) return NULL;
+    pthread_mutex_init(&q->lock, NULL);
+    if (pipe2(q->fd, O_CLOEXEC | O_NONBLOCK) != 0) {
+        free(q);
+        return NULL;
+    }
+    q->looper = NULL;
+    SHIM_TRACE("android_input_queue_create -> %p", (void *)q);
+    return q;
+}
+
+void android_input_queue_push(AInputQueue *q, AInputEvent *e)
+{
+    if (!q || !e) return;
+    pthread_mutex_lock(&q->lock);
+    if (q->n == INPUTQUEUE_MAX) {            // drop the oldest, as a full Android queue would
+        android_input_event_free(q->ev[0]);
+        memmove(q->ev, q->ev + 1, --q->n * sizeof q->ev[0]);
+    }
+    int was_empty = q->n == 0;
+    q->ev[q->n++] = e;
+    if (was_empty) {
+        char one = 1;
+        (void)!write(q->fd[1], &one, 1);     // (non-blocking: a full pipe means a byte is there)
+    }
+    pthread_mutex_unlock(&q->lock);
+}
+
+int32_t AInputQueue_getEvent(AInputQueue *q, AInputEvent **out)
+{
+    if (out) *out = NULL;
+    if (!q) return -1;
+    AInputEvent *e = NULL;
+    pthread_mutex_lock(&q->lock);
+    if (q->n) {
+        e = q->ev[0];
+        memmove(q->ev, q->ev + 1, --q->n * sizeof q->ev[0]);
+        if (!q->n) {
+            char b;
+            (void)!read(q->fd[0], &b, 1);
+        }
+    }
+    pthread_mutex_unlock(&q->lock);
+    if (!e) return -1;
+    if (out) *out = e;
+    return 0;
+}
+
+int32_t AInputQueue_hasEvents(AInputQueue *q)
+{
+    if (!q) return 0;
+    pthread_mutex_lock(&q->lock);
+    int n = q->n;
+    pthread_mutex_unlock(&q->lock);
+    return n;
+}
+
 int32_t AInputQueue_preDispatchEvent(AInputQueue *q, AInputEvent *e) { (void)q; (void)e; return 0; }
-void AInputQueue_finishEvent(AInputQueue *q, AInputEvent *e, int handled) { (void)q; (void)e; (void)handled; }
+
+void AInputQueue_finishEvent(AInputQueue *q, AInputEvent *e, int handled)
+{
+    (void)q; (void)handled;
+    android_input_event_free(e);
+}
+
 void AInputQueue_attachLooper(AInputQueue *q, ALooper *l, int ident, ALooper_callbackFunc cb, void *data)
-{ (void)q; (void)l; (void)ident; (void)cb; (void)data; }
-void AInputQueue_detachLooper(AInputQueue *q) { (void)q; }
+{
+    if (!q || !l) return;
+    q->looper = l;
+    ALooper_addFd(l, q->fd[0], ident, ALOOPER_EVENT_INPUT, cb, data);
+    SHIM_TRACE("AInputQueue_attachLooper(%p, %p)", (void *)q, (void *)l);
+}
+
+void AInputQueue_detachLooper(AInputQueue *q)
+{
+    if (!q || !q->looper) return;
+    ALooper_removeFd(q->looper, q->fd[0]);
+    q->looper = NULL;
+}
+
+// ANativeActivity_finish: what the engine asks for at exit; the host installs the action.
+static void (*g_activity_finish)(void *);
+
+void android_set_activity_finish(void (*fn)(void *activity)) { g_activity_finish = fn; }
+
+void ANativeActivity_finish(void *activity)
+{
+    SHIM_TRACE("ANativeActivity_finish(%p)", activity);
+    if (g_activity_finish) g_activity_finish(activity);
+}
 
 // ---- sensors: a manager with an empty list -------------------------------------------------
 struct ASensorManager { int dummy; };

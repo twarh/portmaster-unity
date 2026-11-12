@@ -75,7 +75,10 @@ STATE_VERSION = 10      # bump when an action's output changes
 
 # --------------------------------------------------------------------------- file placement
 
-_libc = ctypes.CDLL(None, use_errno=True)
+try:
+    _libc = ctypes.CDLL(None, use_errno=True)   # not available on Windows
+except (TypeError, OSError):
+    _libc = None
 _clonefile = getattr(_libc, 'clonefile', None)
 
 

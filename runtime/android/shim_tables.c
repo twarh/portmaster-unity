@@ -37,6 +37,7 @@ typedef struct { const char *name; void *fn; } so_shim;
     X(AKeyEvent_getRepeatCount) X(AKeyEvent_getScanCode) X(AKeyEvent_getDownTime) X(AKeyEvent_getEventTime) \
     X(AMotionEvent_getAction) X(AMotionEvent_getPointerCount) X(AMotionEvent_getPointerId) \
     X(AMotionEvent_getX) X(AMotionEvent_getY) X(AMotionEvent_getAxisValue) \
+    X(AMotionEvent_getButtonState) X(AMotionEvent_getToolType) X(ANativeActivity_finish) \
     X(AInputQueue_getEvent) X(AInputQueue_hasEvents) X(AInputQueue_preDispatchEvent) \
     X(AInputQueue_finishEvent) X(AInputQueue_attachLooper) X(AInputQueue_detachLooper) \
     X(ASensorManager_getInstance) X(ASensorManager_getInstanceForPackage) X(ASensorManager_getSensorList) \
