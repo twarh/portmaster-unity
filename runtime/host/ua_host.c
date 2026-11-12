@@ -629,6 +629,7 @@ int main(int argc, char **argv)
     so_register_fake_lib("liblog.so", android_log_shims);
     so_register_fake_lib("libandroid.so", android_ndk_shims);
     so_register_fake_lib("libOpenSLES.so", android_sles_shims);
+    so_register_fake_lib("libaaudio.so", android_aaudio_shims);   // Unity 6's FMOD output
     // libmediandk: 2017.4-2021.3 players dlopen it and decode video through Java when that fails
     // (../jni/up_media.c); 2022.3 links it (the shims in ../android/media_ndk.c)
     so_map_library("libmediandk.so", NULL);

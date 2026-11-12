@@ -394,7 +394,7 @@ static const char *const g_android_only[] = {
 /* libraries whose dlopen() must fail cleanly (features we do not provide) */
 static const char *const g_denied_prefix[] = {
     "libvulkan", "libOpenMAXAL", "libOMX", "libomx", "libstagefright",
-    "libaaudio", "libcamera2ndk", "libneuralnetworks", NULL
+    "libcamera2ndk", "libneuralnetworks", NULL
 };
 
 static int fakelib_registered_hint(const char *name);

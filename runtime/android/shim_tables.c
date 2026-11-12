@@ -123,6 +123,25 @@ static const struct { const char *prefix; int api; } NDK_API_LEVELS[] = {
     X(SL_IID_PLAYBACKRATE) X(SL_IID_SEEK) X(SL_IID_PREFETCHSTATUS) X(SL_IID_METADATAEXTRACTION) \
     X(SL_IID_ANDROIDEFFECT) X(SL_IID_ANDROIDBUFFERQUEUESOURCE)
 
+// libaaudio.so (aaudio.c): Unity 6's FMOD output streams; each one is an OpenSL buffer-queue player
+#define AAUDIO_FUNCS(X) \
+    X(AAudio_createStreamBuilder) X(AAudio_convertResultToText) X(AAudio_convertStreamStateToText) \
+    X(AAudioStreamBuilder_delete) X(AAudioStreamBuilder_setDeviceId) X(AAudioStreamBuilder_setDirection) \
+    X(AAudioStreamBuilder_setSharingMode) X(AAudioStreamBuilder_setSampleRate) \
+    X(AAudioStreamBuilder_setChannelCount) X(AAudioStreamBuilder_setFormat) \
+    X(AAudioStreamBuilder_setBufferCapacityInFrames) X(AAudioStreamBuilder_setPerformanceMode) \
+    X(AAudioStreamBuilder_setUsage) X(AAudioStreamBuilder_setContentType) X(AAudioStreamBuilder_setSessionId) \
+    X(AAudioStreamBuilder_setDataCallback) X(AAudioStreamBuilder_setErrorCallback) \
+    X(AAudioStreamBuilder_setFramesPerDataCallback) X(AAudioStreamBuilder_openStream) \
+    X(AAudioStream_close) X(AAudioStream_requestStart) X(AAudioStream_requestStop) X(AAudioStream_getState) \
+    X(AAudioStream_waitForStateChange) X(AAudioStream_getSampleRate) X(AAudioStream_getChannelCount) \
+    X(AAudioStream_getDeviceId) X(AAudioStream_getSharingMode) X(AAudioStream_getPerformanceMode) \
+    X(AAudioStream_getFramesPerBurst) X(AAudioStream_getFramesPerDataCallback) \
+    X(AAudioStream_getBufferSizeInFrames) X(AAudioStream_setBufferSizeInFrames) \
+    X(AAudioStream_getBufferCapacityInFrames) X(AAudioStream_getXRunCount) \
+    X(AAudioStream_getHardwareSampleRate) X(AAudioStream_getHardwareChannelCount) \
+    X(AAudioStream_getHardwareFormat) X(AAudioStream_getSessionId) X(AAudioStream_isMMapUsed)
+
 // libmediandk.so (media_ndk.c): the media core's (../media) when linked, else stubs; the keys are data
 #define MEDIANDK_FUNCS(X) \
     X(AMediaFormat_new) X(AMediaFormat_delete) X(AMediaFormat_toString) X(AMediaFormat_getInt32) \
@@ -165,6 +184,7 @@ LOG_FUNCS(DECL_FN)
 NDK_FUNCS(DECL_FN)
 SLES_FUNCS(DECL_FN)
 SLES_IIDS(DECL_VAR)
+AAUDIO_FUNCS(DECL_FN)
 MEDIANDK_FUNCS(DECL_FN)
 MEDIANDK_KEYS(DECL_VAR)
 
@@ -175,10 +195,11 @@ MEDIANDK_KEYS(DECL_VAR)
 so_shim android_log_shims[] = { LOG_FUNCS(ENT_FN) { NULL, NULL } };
 so_shim android_ndk_shims[] = { NDK_FUNCS(ENT_FN) { NULL, NULL } };
 so_shim android_sles_shims[] = { SLES_FUNCS(ENT_FN) SLES_IIDS(ENT_VAR) { NULL, NULL } };
+so_shim android_aaudio_shims[] = { AAUDIO_FUNCS(ENT_FN) { NULL, NULL } };
 so_shim android_mediandk_shims[] = { MEDIANDK_FUNCS(ENT_FN) MEDIANDK_KEYS(ENT_VAR) { NULL, NULL } };
 so_shim android_shims[] = {
     LOG_FUNCS(ENT_FN) NDK_FUNCS(ENT_FN) SLES_FUNCS(ENT_FN) SLES_IIDS(ENT_VAR)
-    MEDIANDK_FUNCS(ENT_FN) MEDIANDK_KEYS(ENT_VAR) { NULL, NULL }
+    AAUDIO_FUNCS(ENT_FN) MEDIANDK_FUNCS(ENT_FN) MEDIANDK_KEYS(ENT_VAR) { NULL, NULL }
 };
 
 // the API level a libandroid function appeared in (the first matching entry: exact names and
@@ -233,6 +254,10 @@ const so_shim *android_shims_for_library(const char *path)
     if (!strcmp(base, "liblog.so")) return android_log_shims;
     if (!strcmp(base, "libandroid.so")) return android_ndk_shims;
     if (!strcmp(base, "libOpenSLES.so")) return android_sles_shims;
+    // libaaudio.so: from API 26 (below the reported level, as on such a phone, dlopen fails and
+    // Unity's FMOD falls back to OpenSL)
+    if (!strcmp(base, "libaaudio.so"))
+        return g_api_level <= 0 || g_api_level >= 26 ? android_aaudio_shims : NULL;
     if (!strcmp(base, "libmediandk.so")) return android_mediandk_shims;
     return NULL;
 }

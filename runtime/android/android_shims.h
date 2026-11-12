@@ -6,6 +6,7 @@
 //   libandroid.so  ANativeWindow_*, AAssetManager_*/AAsset*, AConfiguration_*, ALooper_*,
 //                  AInputEvent_*/AKeyEvent_*/AMotionEvent_*, ASensor* (no sensors)
 //   libOpenSLES.so slCreateEngine + SL_IID_* (engine, output mix, PCM buffer-queue player) -> SDL2
+//   libaaudio.so   AAudio (AAudioStreamBuilder/AAudioStream, output, data callback) -> the OpenSL player
 //   libmediandk.so AMediaCodec_*, AMediaExtractor_*, AMediaFormat_*, AImageReader_*, AImage_*,
 //                  AMediaDataSource_* failing cleanly (no decoder), AMEDIAFORMAT_KEY_* constants
 // EGL translation (ANativeWindow* -> Mali fbdev_window*) lives in egl_glue.h (egl_shims[]).
@@ -34,10 +35,11 @@ typedef struct { const char *name; void *fn; } so_shim;
 #endif
 
 // ---- shim tables (null-terminated) ---------------------------------------------------------
-extern so_shim android_shims[];       // everything below (liblog + libandroid + libOpenSLES + libmediandk)
+extern so_shim android_shims[];       // everything below (liblog + libandroid + libOpenSLES + libaaudio + libmediandk)
 extern so_shim android_log_shims[];   // liblog.so only
 extern so_shim android_ndk_shims[];   // libandroid.so only
 extern so_shim android_sles_shims[];  // libOpenSLES.so only (SL_IID_* entries point at the variables)
+extern so_shim android_aaudio_shims[]; // libaaudio.so only (aaudio.c: AAudio output streams on the OpenSL player)
 extern so_shim android_mediandk_shims[]; // libmediandk.so only (AMEDIAFORMAT_KEY_* entries: the variables)
 
 // Another sound mixed into the game's own audio output (ua_host's Wwise player, runtime/host/wwplay.c):
