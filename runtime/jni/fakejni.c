@@ -672,6 +672,24 @@ static fj_method *method_find(fj_class *c, const char *name, const char *sig, in
     return NULL;
 }
 
+/* Newer Unity asks for generic returns ("()Ljava/lang/Object;" for getClass, getApplicationContext...):
+   when only the return type differs, answer with the method that has the same name and parameters. */
+static fj_method *method_find_loose(fj_class *c, const char *name, const char *sig, int is_static, int depth)
+{
+    if (!c || depth > 64) return NULL;
+    const char *rp = strrchr(sig, ')');
+    if (!rp || strcmp(rp + 1, "Ljava/lang/Object;")) return NULL;
+    size_t pl = (size_t)(rp - sig) + 1;
+    for (fj_method *m = c->methods; m; m = m->next)
+        if (!m->placeholder && m->is_static == is_static && !strcmp(m->name, name) &&
+            strlen(m->sig) > pl && !strncmp(m->sig, sig, pl) && (m->fn || m->native_fn)) return m;
+    fj_method *r = method_find_loose(c->super, name, sig, is_static, depth + 1);
+    if (r) return r;
+    for (fj_iface *i = c->ifaces; i; i = i->next)
+        if ((r = method_find_loose(i->cls, name, sig, is_static, depth + 1))) return r;
+    return NULL;
+}
+
 static fj_method *method_new(fj_class *c, const char *name, const char *sig, int is_static)
 {
     fj_method *m = xcalloc(1, sizeof *m);
@@ -1236,6 +1254,7 @@ static jvalue invoke(JNIEnv *env, jobject self, fj_method *m, const jvalue *args
         else {
             LOCK();
             fj_method *real = method_find(t->cls, t->name, t->sig, t->is_static, 0);
+            if (!real) real = method_find_loose(t->cls, t->name, t->sig, t->is_static, 0);
             if (real && real != t) t->alias = real, t = real;
             UNLOCK();
         }
