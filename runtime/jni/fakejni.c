@@ -2456,6 +2456,13 @@ static jvalue m_thr_getStackTrace(JNIEnv *e, jobject self, const jvalue *a, void
 static jvalue m_meth_getName(JNIEnv *e, jobject self, const jvalue *a, void *ud)
 { (void)e; (void)a; (void)ud; fj_method *m = M((jmethodID)fj_data(self)); return fj_l(fj_string(m ? m->name : "")); }
 
+static jvalue m_fld_getDeclaringClass(JNIEnv *e, jobject self, const jvalue *a, void *ud)
+{ (void)e; (void)a; (void)ud; fj_field *f = (fj_field *)fj_data(self); return fj_l(f && f->magic == FJ_MAGIC_F ? (jobject)f->cls : NULL); }
+static jvalue m_fld_getName(JNIEnv *e, jobject self, const jvalue *a, void *ud)
+{ (void)e; (void)a; (void)ud; fj_field *f = (fj_field *)fj_data(self); return fj_l(fj_string(f && f->magic == FJ_MAGIC_F ? f->name : "")); }
+static jvalue m_meth_getDeclaringClass(JNIEnv *e, jobject self, const jvalue *a, void *ud)
+{ (void)e; (void)a; (void)ud; fj_method *m = M((jmethodID)fj_data(self)); return fj_l(m ? (jobject)m->cls : NULL); }
+
 /* boxing */
 #define BOX(cls, T, sig, getter, fld)                                                          \
 static jvalue m_##T##_valueOf(JNIEnv *e, jobject self, const jvalue *a, void *ud)              \
@@ -2652,6 +2659,9 @@ static void define_builtins(void)
     C_Method = (fj_class *)fj_class_define("java/lang/reflect/Method", NULL);
     FJ_METHOD("java/lang/reflect/Method", "getName", "()Ljava/lang/String;", m_meth_getName);
     C_Field = (fj_class *)fj_class_define("java/lang/reflect/Field", NULL);
+    FJ_METHOD("java/lang/reflect/Field", "getDeclaringClass", "()Ljava/lang/Class;", m_fld_getDeclaringClass);
+    FJ_METHOD("java/lang/reflect/Field", "getName", "()Ljava/lang/String;", m_fld_getName);
+    FJ_METHOD("java/lang/reflect/Method", "getDeclaringClass", "()Ljava/lang/Class;", m_meth_getDeclaringClass);
     fj_class_define("java/nio/Buffer", NULL);
     C_ByteBuffer = (fj_class *)fj_class_define("java/nio/ByteBuffer", "java/nio/Buffer");
     fj_class_define("java/nio/DirectByteBuffer", "java/nio/ByteBuffer");
