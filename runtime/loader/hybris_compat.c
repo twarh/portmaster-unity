@@ -1212,6 +1212,19 @@ static int bionic_attr_setstacksize(pthread_attr_t *attr, size_t size)
 // host's, or libhybris's translation of the bionic FILE objects)
 static FILE *bionic_freopen64(const char *path, const char *mode, FILE *fp) { return freopen(path, mode, fp); }
 
+/* bionic has both strerror_r forms: the POSIX one as strerror_r (returns int) and the GNU one as
+ * __gnu_strerror_r (returns the message: buf on success, or bionic's own static string when it does
+ * not fit). Unity 6000.4's libunity imports the GNU one. bionic's errno values are the kernel's and
+ * glibc uses the same numbering, so the message lookup is strerror's, as for the rest of libc. */
+static char *bionic_gnu_strerror_r(int errnum, char *buf, size_t buflen)
+{
+    const char *msg = strerror(errnum);
+    size_t n = strlen(msg) + 1;
+    if (!buf || n > buflen) return (char *)msg;
+    memcpy(buf, msg, n);
+    return buf;
+}
+
 static const so_shim ours[] = {
     { "dlopen", (void *)so_dlopen }, { "dlsym", (void *)so_dlsym }, { "dlclose", (void *)so_dlclose },
     { "dlerror", (void *)so_dlerror },
@@ -1264,6 +1277,7 @@ static const so_shim ours[] = {
     { "mbrtowc", (void *)bionic_mbrtowc }, { "wcrtomb", (void *)bionic_wcrtomb }, { "ungetwc", (void *)bionic_ungetwc },
     { "getnameinfo", (void *)bionic_getnameinfo }, { "__system_property_get", (void *)bionic_system_property_get },
     { "freopen64", (void *)bionic_freopen64 },          /* bionic 64-bit stdio alias of freopen */
+    { "__gnu_strerror_r", (void *)bionic_gnu_strerror_r },  /* GNU strerror_r: Unity 6000.4 */
     /* newer players */
     { "android_set_abort_message", (void *)bionic_android_set_abort_message },
     { "__FD_SET_chk", (void *)bionic_FD_SET_chk }, { "__FD_CLR_chk", (void *)bionic_FD_CLR_chk },
