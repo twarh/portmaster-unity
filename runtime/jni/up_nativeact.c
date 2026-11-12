@@ -170,7 +170,7 @@ void up_nativeact_register(void)
 
     reg("platformIsSignedIn", "()Z", na_false);
     reg("platformIsSigningIn", "()Z", na_false);
-    reg("platformSaveGamesAvailable", "()Z", na_true);
+    reg("platformSaveGamesAvailable", "()Z", na_false); /* no cloud saves: engine hangs waiting for platformSaveGameRead completion */
     reg("platformSignIn", "()V", na_void);
     reg("platformSignOut", "()V", na_void);
     reg("platformShowSignInOverlay", "()V", na_void);
