@@ -1265,6 +1265,17 @@ static jvalue invoke(JNIEnv *env, jobject self, fj_method *m, const jvalue *args
             fmt_args(&m->ps, args, a, sizeof a);
             fj_log("UNIMPLEMENTED call %s.%s%s (%s) -> default", m->cls->name, m->name, m->sig, a);
         }
+        /* Java-only SDK builders (Play Billing): hand back an object so chained calls do not NPE */
+        if (m->ps.ret == 'L' && !strncmp(m->cls->name, "com/android/billingclient/", 26)) {
+            const char *rs = strrchr(m->sig, ')');
+            char rn[256] = "";
+            if (rs && rs[1] == 'L') {
+                size_t n = strcspn(rs + 2, ";");
+                if (n < sizeof rn) { memcpy(rn, rs + 2, n); rn[n] = 0; }
+            }
+            if (!rn[0] || !strcmp(rn, "java/lang/Object")) snprintf(rn, sizeof rn, "%s", m->cls->name);
+            if (strcmp(rn, "java/lang/String")) r.l = fj_new_by_name(rn, NULL, NULL);
+        }
     }
     if (g_trace && m->ps.ret != 'V') {
         char rb[200];
