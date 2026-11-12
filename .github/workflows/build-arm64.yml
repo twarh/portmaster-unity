@@ -13,11 +13,6 @@ jobs:
           submodules: recursive
       - name: Runtime (ua_host arm64)
         run: ARCH=arm64 sh runtime/build.sh 2>&1 | tee runtime-build.log
-      - name: Setup Python bundle (pybundle; the ua-rust base image for pmu is not in the repo)
-        run: |
-          set -o pipefail
-          mkdir -p out
-          bash tools/port/build_pybundle.sh out/pybundle.tar.gz 2>&1 | tee pybundle-build.log
       - name: Collect
         if: always()
         run: |
