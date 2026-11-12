@@ -18,17 +18,20 @@
 #include "../android/egl_glue.h"
 #include "../jni/fakejni.h"
 #include "display.h"
+#include "pointer.h"
 
 #include <SDL2/SDL.h>
 
 #include <dirent.h>
 #include <errno.h>
+#include <math.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 /* ---- the NDK's android/native_activity.h (no NDK headers here) ------------------------------- */
@@ -76,7 +79,18 @@ static volatile sig_atomic_t g_finish;
 static AInputQueue *g_queue;
 static int g_window_w = 640, g_window_h = 480;
 
-/* egl_glue.c's swap hook (eglSwapBuffers of the engine's thread): proof that frames are presented */
+/* NA_POINTER=1: the right stick moves a virtual cursor over the window and A/R1/RT click at it with
+ * touch events (see na_pointer_tick and on_sdl_event). Off by default: nothing changes then. The
+ * position the render thread reads is published as ints; g_ptr_px/py are the loop thread's exact. */
+static int g_ptr_on, g_ptr_cursor_on;
+static float g_ptr_px, g_ptr_py;                /* window pixels, loop thread */
+static volatile int g_ptr_x, g_ptr_y;           /* the same, rounded, for na_swap_hook */
+static float g_ptr_rx, g_ptr_ry;                /* right stick, -1..1 */
+static unsigned g_ptr_clicks;                   /* click controls held (PTR_A/PTR_R1/PTR_RT) */
+static double g_ptr_last, g_ptr_sent, g_ptr_full;
+
+/* egl_glue.c's swap hook (eglSwapBuffers of the engine's thread): proof that frames are presented,
+ * and where the cursor is drawn (the engine's GL context is current here, just before the swap) */
 static void na_swap_hook(void *ctx)
 {
     static unsigned n;
@@ -84,6 +98,7 @@ static void na_swap_hook(void *ctx)
     n++;
     if (n == 1) fprintf(stderr, "[na] first swap\n");
     if (n % 60 == 0) fprintf(stderr, "[na] swap %u\n", n);
+    if (g_ptr_on && g_ptr_cursor_on) pointer_draw_at(g_ptr_x, g_ptr_y, g_window_w, g_window_h);
 }
 
 static void on_activity_finish(void *activity) { (void)activity; g_finish = 1; }
@@ -190,6 +205,66 @@ static void push_motion(int32_t action, int x, int y)
     android_input_queue_push(g_queue, android_input_event_new_motion(0, action, x, y));
 }
 
+/* ---- NA_POINTER: the right stick's virtual cursor ------------------------------------------- */
+/* The engine in TOUCH mode turns a touch down/up pair into a tap and draws no cursor of its own, so
+ * the host draws one and clicks for it. Touch coordinates are window pixels, the same space the
+ * mouse events above use. Clicks are the click controls only; no motion events are sent while the
+ * cursor idles (the engine would read a hover as a finger). */
+enum { PTR_A = 1, PTR_R1 = 2, PTR_RT = 4 };
+#define PTR_DEADZONE (8000.0f / 32768.0f)   /* per axis */
+#define PTR_SPEED    500.0f                 /* px/s at full deflection (a 640x480 window) */
+#define PTR_FULL_S   0.4                    /* full deflection this long doubles the speed */
+
+static void na_pointer_click(unsigned bit, int down)
+{
+    if (down) {
+        if (!g_ptr_clicks) push_motion(0, g_ptr_x, g_ptr_y);       /* AKEY_EVENT_ACTION_DOWN */
+        g_ptr_clicks |= bit;
+    } else if (g_ptr_clicks & bit) {
+        g_ptr_clicks &= ~bit;
+        if (!g_ptr_clicks) push_motion(1, g_ptr_x, g_ptr_y);       /* AKEY_EVENT_ACTION_UP */
+    }
+}
+
+/* the loop's tick (the ~4 ms poll): moves the cursor by the real elapsed time, so the speed does
+ * not follow the loop's or the engine's frame rate */
+static void na_pointer_tick(void)
+{
+    if (!g_ptr_on) return;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    double now = ts.tv_sec + ts.tv_nsec / 1e9;
+    float dt = g_ptr_last > 0 ? (float)(now - g_ptr_last) : 0.004f;
+    g_ptr_last = now;
+    if (dt > 0.1f) dt = 0.1f;                   /* a stall must not throw the cursor across */
+
+    float rx = g_ptr_rx, ry = g_ptr_ry;
+    if (fabsf(rx) < PTR_DEADZONE) rx = 0;
+    if (fabsf(ry) < PTR_DEADZONE) ry = 0;
+    if (rx || ry) {
+        float m = sqrtf(rx * rx + ry * ry);
+        if (m > 1) { rx /= m; ry /= m; m = 1; }
+        g_ptr_full = m >= 0.99f ? g_ptr_full + dt : 0;
+        float v = PTR_SPEED * m * (g_ptr_full >= PTR_FULL_S ? 2.0f : 1.0f);
+        g_ptr_px += rx * v * dt;
+        g_ptr_py += ry * v * dt;
+        if (g_ptr_px < 0) g_ptr_px = 0; else if (g_ptr_px > g_window_w - 1) g_ptr_px = g_window_w - 1;
+        if (g_ptr_py < 0) g_ptr_py = 0; else if (g_ptr_py > g_window_h - 1) g_ptr_py = g_window_h - 1;
+        int nx = (int)lroundf(g_ptr_px), ny = (int)lroundf(g_ptr_py);
+        if (g_ptr_clicks && (nx != g_ptr_x || ny != g_ptr_y) && now - g_ptr_sent >= 0.016) {
+            g_ptr_sent = now;                   /* AKEY_EVENT_ACTION_MOVE while held */
+            push_motion(2, nx, ny);
+        }
+    }
+    g_ptr_x = (int)lroundf(g_ptr_px);
+    g_ptr_y = (int)lroundf(g_ptr_py);
+}
+
+static int na_pointer_button(Uint8 b)
+{
+    return b == SDL_CONTROLLER_BUTTON_A ? PTR_A : b == SDL_CONTROLLER_BUTTON_RIGHTSHOULDER ? PTR_R1 : 0;
+}
+
 static void on_sdl_event(const SDL_Event *e)
 {
     switch (e->type) {
@@ -203,10 +278,25 @@ static void on_sdl_event(const SDL_Event *e)
         push_key(1, key_of(e->key.keysym.sym));
         break;
     case SDL_CONTROLLERBUTTONDOWN:
+        if (g_ptr_on && na_pointer_button(e->cbutton.button)) {
+            na_pointer_click(na_pointer_button(e->cbutton.button), 1);
+            break;
+        }
         push_key(0, padkey_of(e->cbutton.button));
         break;
     case SDL_CONTROLLERBUTTONUP:
+        if (g_ptr_on && na_pointer_button(e->cbutton.button)) {
+            na_pointer_click(na_pointer_button(e->cbutton.button), 0);
+            break;
+        }
         push_key(1, padkey_of(e->cbutton.button));
+        break;
+    case SDL_CONTROLLERAXISMOTION:
+        if (!g_ptr_on) break;
+        if (e->caxis.axis == SDL_CONTROLLER_AXIS_RIGHTX) g_ptr_rx = e->caxis.value / 32768.0f;
+        else if (e->caxis.axis == SDL_CONTROLLER_AXIS_RIGHTY) g_ptr_ry = e->caxis.value / 32768.0f;
+        else if (e->caxis.axis == SDL_CONTROLLER_AXIS_TRIGGERRIGHT)
+            na_pointer_click(PTR_RT, e->caxis.value > 16000);
         break;
     case SDL_MOUSEMOTION:
         if (e->motion.state & (SDL_BUTTON_LMASK | SDL_BUTTON_RMASK | SDL_BUTTON_MMASK))
@@ -296,6 +386,19 @@ int nativeact_run(const char *root, const char *apk_name)
     if (sdk_int < 9) sdk_int = 9;
     android_shims_set_api_level(sdk_int);
 
+    // NA_POINTER=1: the right stick moves a cursor; A/R1/RT click it with touch events. NA_CURSOR=0
+    // keeps the cursor undrawn (a game that shows its own). Both off/unread: the input is as before.
+    const char *np = getenv("NA_POINTER");
+    g_ptr_on = np && *np && strcmp(np, "0") != 0;
+    const char *nc = getenv("NA_CURSOR");
+    g_ptr_cursor_on = !(nc && !strcmp(nc, "0"));
+    g_ptr_px = (g_window_w - 1) * 0.5f;
+    g_ptr_py = (g_window_h - 1) * 0.5f;
+    g_ptr_x = (int)lroundf(g_ptr_px);
+    g_ptr_y = (int)lroundf(g_ptr_py);
+    if (g_ptr_on)
+        fprintf(stderr, "[nativeact] NA_POINTER: right stick moves a cursor, A/R1/RT click at it\n");
+
     // SDL gamepads (the window itself is display_sdl.c's)
     if (SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER) == 0) {
         SDL_GameControllerEventState(SDL_ENABLE);
@@ -365,6 +468,7 @@ int nativeact_run(const char *root, const char *apk_name)
     while (!g_finish && !display_quit_requested()) {
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) on_sdl_event(&ev);
+        na_pointer_tick();
         na_fire_obb_complete(act.env, act.clazz);   /* also if OBBFetch came later (once only) */
         usleep(4000);
     }

@@ -16,4 +16,6 @@ int  pointer_axes_changed(void);                // 1 once after the pads' axes c
 void pointer_warp(double x, double y, int fraction);   // UA_INPUT_SCRIPT ptr=<x>/<y>
 void pointer_tick(void);                        // UI thread, every poll: moves the cursor, sends events
 void pointer_draw(void);                        // render thread, right before the swap
+void pointer_draw_at(int x, int y, int w, int h);   // a host that is not Unity (nativeact.c): the
+                                                    // cursor at a window pixel position, w x h clipped
 int  pointer_in_shots(void);                    // UA_POINTER_SHOTS: draw before screenshots too

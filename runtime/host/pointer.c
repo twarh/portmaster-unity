@@ -633,3 +633,50 @@ void pointer_draw(void)
     if (!sc) gl.Disable(GL_SCISSOR_TEST);
     if (fb) gl.BindFramebuffer(target, (unsigned)fb);
 }
+
+/* The same arrow at a window pixel position, for a host whose frames are not Unity's
+ * (nativeact.c's swap hook), clipped to a w x h window. Nothing else of pointer mode is needed. */
+void pointer_draw_at(int x, int y, int w, int h)
+{
+    if (w <= 0 || h <= 0 || !gl_resolve()) return;
+    int s = h / 400;                    // the default UA_POINTER_SIZE: screen height / 400
+    if (s < 1) s = 1;
+    build_cursor(s);
+    int x0 = x < 0 ? 0 : x >= w ? w - 1 : x;
+    int y0 = y < 0 ? 0 : y >= h ? h - 1 : y;
+    int fb = 0, box[4];
+    float cc[4];
+    unsigned char mask[4];
+    gl.GetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &fb);
+    gl.GetIntegerv(GL_SCISSOR_BOX, box);
+    gl.GetFloatv(GL_COLOR_CLEAR_VALUE, cc);
+    gl.GetBooleanv(GL_COLOR_WRITEMASK, mask);
+    unsigned char sc = gl.IsEnabled(GL_SCISSOR_TEST), rd = gl_es2 ? 0 : gl.IsEnabled(GL_RASTERIZER_DISCARD);
+    unsigned target = gl_es2 ? GL_FRAMEBUFFER : GL_DRAW_FRAMEBUFFER;
+    if (fb != (int)glpresent_fb0()) gl.BindFramebuffer(target, glpresent_fb0());
+    if (!sc) gl.Enable(GL_SCISSOR_TEST);
+    if (rd) gl.Disable(GL_RASTERIZER_DISCARD);
+    gl.ColorMask(1, 1, 1, 1);
+    for (int pass = 0; pass < 2; pass++)
+    {
+        char c = pass ? 'W' : 'X';
+        if (pass) gl.ClearColor(1, 1, 1, 1); else gl.ClearColor(0, 0, 0, 1);
+        for (int i = 0; i < nrects; i++)
+        {
+            const struct rect *r = &rects[i];
+            if (r->c != c) continue;
+            int rx = x0 + r->x, ry = y0 + r->y, rw = r->w, rh = r->h;
+            if (rx >= w || ry >= h) continue;
+            if (rx + rw > w) rw = w - rx;
+            if (ry + rh > h) rh = h - ry;
+            gl.Scissor(rx, h - ry - rh, rw, rh);     // GL's rows count from the bottom
+            gl.Clear(GL_COLOR_BUFFER_BIT);
+        }
+    }
+    gl.ClearColor(cc[0], cc[1], cc[2], cc[3]);
+    gl.ColorMask(mask[0], mask[1], mask[2], mask[3]);
+    gl.Scissor(box[0], box[1], box[2], box[3]);
+    if (rd) gl.Enable(GL_RASTERIZER_DISCARD);
+    if (!sc) gl.Disable(GL_SCISSOR_TEST);
+    if (fb) gl.BindFramebuffer(target, (unsigned)fb);
+}
